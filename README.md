@@ -1,6 +1,6 @@
 # Post-L-Business-Case
 
-Hannes: Baseline model
+Hannes: Baseline model 
 Niklas: Greedy heuristic
 Nicola: Local search / swap heuristic
 Tristan: Simulated annealing / energy-based optimization

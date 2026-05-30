@@ -1,0 +1,27 @@
+
+Operational Daily Demand EDA - Key Findings
+==========================================
+
+1. Annual demand baseline
+In 2025, Maastricht generated 1,351,852 parcel activities in total.
+This consisted of 482,442 deliveries and 869,410 pickups.
+The annual pickup share was 64.31%, while the delivery share was 35.69%.
+
+2. Operational demand baseline
+Sundays were excluded from the main operational analysis because no regular parcel activity takes place on those days.
+The recommended operational baseline is based on operational non-zero days.
+Under this baseline, average daily operational demand is 4,346.8 parcels.
+The 95th percentile operational demand is 5,871.5 parcels, and the maximum observed daily demand is 8,259 parcels.
+
+3. Weekday pattern
+The highest-demand weekday is Tue, with an average of 5,275.6 parcels.
+This means that capacity planning should not only rely on a general average day, but should also stress-test high-demand weekdays.
+
+4. Peak-period pattern
+The highest-demand month is month 12, with an average daily demand of 4,408.1 parcels.
+The top 10 demand days are saved in tables/top_10_peak_demand_days.csv.
+These peak days are important for bounce-rate modelling because service point capacity problems are most likely to occur on high-volume days.
+
+5. Modelling implication
+Historical activity should be used to define total city-wide demand, while the pickup-versus-delivery split can start from the observed annual pickup share of 64.31%.
+Because pickup share is stable over time, distance to the nearest service point should likely be the main driver used to adjust pickup probability in the consumer behavior model.

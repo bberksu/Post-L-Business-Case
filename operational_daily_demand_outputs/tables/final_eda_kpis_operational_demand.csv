@@ -1,0 +1,19 @@
+kpi,value
+Annual total parcels,1351852
+Annual deliveries,482442
+Annual pickups,869410
+Annual pickup share,0.6431251349999852
+Annual delivery share,0.3568748650000148
+Calendar-day average demand,3703.7041095890413
+Operational baseline used,operational non-zero days
+Number of operational days,311
+Average operational daily demand,4346.790996784566
+Median operational daily demand,4268.0
+90th percentile operational demand,5394.0
+95th percentile operational demand,5871.5
+Maximum daily demand,8259
+Highest-demand weekday,Tue
+Average demand on highest-demand weekday,5275.596153846154
+Highest-demand month,12
+Average daily demand in highest-demand month,4408.129032258064
+Non-Sunday zero-demand days,2

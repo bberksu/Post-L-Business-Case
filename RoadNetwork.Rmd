@@ -1,0 +1,700 @@
+---
+title: "RoadNetwork"
+date: "2026-05-22"
+output:
+  pdf_document:
+    latex_engine: xelatex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+setwd("/Users/beliz/Desktop/business_analytics/year2/E-Lab 2 Cases/Post&L-eLab2")
+
+library(readxl)
+library(igraph)
+library(ggplot2)
+library(dplyr)
+library(FNN)       # fast KD-tree nearest neighbour
+library(tidyr)
+library(scales)
+library(patchwork) # combine plots
+library(ggrepel)
+```
+
+## Loading Data
+
+```{r}
+DATA_PATH <- "/Users/beliz/Desktop/business_analytics/year2/E-Lab 2 Cases/Post&L-eLab2/data_Maastricht_2025.xlsx"
+
+# -----------------------------------------------------------------------
+# 1. LOAD DATA
+# -----------------------------------------------------------------------
+cat("Loading data...\n")
+
+nodes <- read_excel(DATA_PATH, sheet = "Nodes")
+edges <- read_excel(DATA_PATH, sheet = "Edges")
+cbs   <- read_excel(DATA_PATH, sheet = "CBS Squares")
+sp    <- read_excel(DATA_PATH, sheet = "Service Point Locations")
+
+# Clean column names
+colnames(nodes) <- c("node_id", "x", "y", "square")
+colnames(sp)    <- c("sp_id", "x", "y", "square")
+colnames(cbs)[1] <- "square"
+
+# Drop CBS squares with no coordinates
+cbs <- cbs %>% filter(!is.na(X), !is.na(Y)) %>%
+  rename(x = X, y = Y)
+
+cat(sprintf("  Nodes: %d | Edges: %d | CBS squares: %d | Service points: %d\n",
+            nrow(nodes), nrow(edges), nrow(cbs), nrow(sp)))
+
+edges <- read_excel(DATA_PATH, sheet = "Edges")
+head(edges)
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r}
+# -----------------------------------------------------------------------
+# 2. BUILD GRAPH
+# -----------------------------------------------------------------------
+cat("Building graph...\n")
+
+# Build edge list — add reverse edges for two-way roads
+edge_list <- edges %>%
+  select(V1, V2, DIST, ONE_WAY, TYPE) %>%
+  mutate(ONE_WAY = as.logical(ONE_WAY))
+
+two_way <- edge_list %>%
+  filter(!ONE_WAY) %>%
+  rename(V1 = V2, V2 = V1)   # flip direction
+
+all_edges <- bind_rows(edge_list, two_way)
+
+g <- graph_from_data_frame(
+  d        = all_edges %>% select(V1, V2, DIST, TYPE),
+  directed = TRUE,
+  vertices = nodes %>% select(node_id, x, y)
+)
+
+cat(sprintf("  Graph: %d nodes, %d edges\n", vcount(g), ecount(g)))
+```
+
+```{r}
+# -----------------------------------------------------------------------
+# 3. CONNECTIVITY CHECK
+# -----------------------------------------------------------------------
+cat("\n-- Connectivity --\n")
+
+# Weak connectivity (ignoring direction)
+wc <- components(g, mode = "weak")
+cat(sprintf("  Weakly connected components : %d\n", wc$no))
+cat(sprintf("  Largest WCC size            : %d nodes\n", max(wc$csize)))
+cat(sprintf("  Is weakly connected?        : %s\n", is_connected(g, mode = "weak")))
+
+# Strong connectivity (following direction)
+sc <- components(g, mode = "strong")
+cat(sprintf("  Strongly connected components : %d\n", sc$no))
+cat(sprintf("  Largest SCC size              : %d nodes (%.1f%%)\n",
+            max(sc$csize), 100 * max(sc$csize) / vcount(g)))
+cat(sprintf("  Is strongly connected?        : %s\n", is_connected(g, mode = "strong")))
+
+
+```
+
+```{r}
+# -----------------------------------------------------------------------
+# 4. PLOT ROAD NETWORK
+# -----------------------------------------------------------------------
+cat("\nPlotting road network...\n")
+
+# Build edge coordinates data frame for ggplot
+edge_df <- data.frame(
+  x1   = as.numeric(V(g)$x)[match(as.character(all_edges$V1), V(g)$name)],
+  y1   = as.numeric(V(g)$y)[match(as.character(all_edges$V1), V(g)$name)],
+  x2   = as.numeric(V(g)$x)[match(as.character(all_edges$V2), V(g)$name)],
+  y2   = as.numeric(V(g)$y)[match(as.character(all_edges$V2), V(g)$name)],
+  type = tolower(trimws(all_edges$TYPE))
+) %>% filter(!is.na(x1), !is.na(x2))
+
+road_colours <- c(
+  "motorway"      = "#e74c3c",
+  "trunk"         = "#e67e22",
+  "primary"       = "#f1c40f",
+  "secondary"     = "#2ecc71",
+  "tertiary"      = "#3498db",
+  "residential"   = "#95a5a6",
+  "busway"        = "#9b59b6",
+  "service"       = "#bdc3c7",
+  "unclassified"  = "#ecf0f1",
+  "pedestrian"    = "#d35400",
+  "living_street" = "#1abc9c"
+)
+
+p_network <- ggplot() +
+  geom_segment(data = edge_df,
+               aes(x = x1, y = y1, xend = x2, yend = y2, colour = type),
+               linewidth = 0.3, alpha = 0.7) +
+  geom_point(data = nodes, aes(x = x, y = y),
+             colour = "white", size = 0.3, alpha = 0.3) +
+  geom_point(data = sp, aes(x = x, y = y),
+             colour = "#ff4757", size = 3, shape = 8, stroke = 1) +
+  scale_colour_manual(values = road_colours, na.value = "#555555",
+                      name = "Road type") +
+  theme_void() +
+  theme(
+    plot.background  = element_rect(fill = "#1a1a2e", colour = NA),
+    panel.background = element_rect(fill = "#1a1a2e", colour = NA),
+    legend.text      = element_text(colour = "white", size = 7),
+    legend.title     = element_text(colour = "white", size = 8),
+    plot.title       = element_text(colour = "white", size = 13, hjust = 0.5)
+  ) +
+  labs(title = "Maastricht Road Network — Nodes & Edges")
+
+ggsave("01_road_network.png", p_network, width = 12, height = 12, dpi = 150)
+cat("  Saved -> 01_road_network.png\n")
+```
+
+```{r}
+# -----------------------------------------------------------------------
+# 5a. NEAREST SERVICE POINT — STRAIGHT-LINE (KD-TREE)
+# -----------------------------------------------------------------------
+cat("\nCalculating straight-line distances...\n")
+
+cbs_coords <- as.matrix(cbs[, c("x", "y")])
+sp_coords  <- as.matrix(sp[,  c("x", "y")])
+
+nn_result <- get.knnx(data = sp_coords, query = cbs_coords, k = 1)
+
+cbs$nearest_sp_sl    <- sp$sp_id[nn_result$nn.index[, 1]]
+cbs$dist_sl_m        <- nn_result$nn.dist[, 1]
+cbs$dist_sl_km       <- cbs$dist_sl_m / 1000
+
+cat(sprintf("  Mean   straight-line: %.2f km\n", mean(cbs$dist_sl_km)))
+cat(sprintf("  Median straight-line: %.2f km\n", median(cbs$dist_sl_km)))
+cat(sprintf("  Max    straight-line: %.2f km\n", max(cbs$dist_sl_km)))
+```
+
+```{r}
+# -----------------------------------------------------------------------
+# 5b. NEAREST SERVICE POINT — NETWORK DISTANCE (DIJKSTRA)
+# -----------------------------------------------------------------------
+cat("\nCalculating network distances (Dijkstra)...\n")
+
+# Map each point to nearest graph node using KD-tree
+node_coords <- cbind(as.numeric(V(g)$x), as.numeric(V(g)$y))
+node_names  <- V(g)$name
+
+nearest_graph_node <- function(coords_matrix) {
+  nn <- get.knnx(data = node_coords, query = coords_matrix, k = 1)
+  node_names[nn$nn.index[, 1]]
+}
+
+sp_nodes  <- nearest_graph_node(sp_coords)
+cbs_nodes <- nearest_graph_node(cbs_coords)
+
+sp_df_net <- data.frame(sp_id = sp$sp_id, graph_node = sp_nodes,
+                         stringsAsFactors = FALSE)
+sp_unique_nodes <- unique(sp_nodes)
+
+cat(sprintf("  Running Dijkstra from %d service point nodes...\n",
+            length(sp_unique_nodes)))
+
+# For each CBS square: find minimum distance across all SPs
+net_dist  <- rep(Inf, nrow(cbs))
+net_sp_id <- rep(NA,  nrow(cbs))
+
+for (spn in sp_unique_nodes) {
+  
+  # Compute distances from this SP node to ALL graph nodes (no duplicate issue)
+  all_dists <- distances(g, v = spn, weights = E(g)$DIST, mode = "out")
+  
+  # Extract distance for each CBS square's nearest node
+  dists <- as.numeric(all_dists[1, cbs_nodes])
+  
+  sp_ids_here <- sp_df_net$sp_id[sp_df_net$graph_node == spn]
+  
+  better <- dists < net_dist
+  net_dist[better]  <- dists[better]
+  net_sp_id[better] <- sp_ids_here[1]
+}
+
+cbs$nearest_sp_net <- net_sp_id
+cbs$dist_net_m     <- ifelse(is.infinite(net_dist), NA, net_dist)
+cbs$dist_net_km    <- cbs$dist_net_m / 1000
+cbs$detour_factor  <- cbs$dist_net_m / cbs$dist_sl_m
+
+valid <- cbs %>% filter(!is.na(dist_net_km))
+cat(sprintf("  Squares with path found : %d / %d\n", nrow(valid), nrow(cbs)))
+cat(sprintf("  Mean   network dist : %.2f km\n", mean(valid$dist_net_km)))
+cat(sprintf("  Median network dist : %.2f km\n", median(valid$dist_net_km)))
+cat(sprintf("  Max    network dist : %.2f km\n", max(valid$dist_net_km)))
+cat(sprintf("  Mean detour factor  : %.2fx\n",  mean(valid$detour_factor, na.rm = TRUE)))
+```
+
+```{r}
+# -----------------------------------------------------------------------
+# 6. DISTANCE DISTRIBUTION PLOTS
+# -----------------------------------------------------------------------
+cat("\nPlotting distance distributions...\n")
+
+# -- Histogram: straight-line ----------------------------------------------─
+p_sl <- ggplot(cbs, aes(x = dist_sl_km)) +
+  geom_histogram(bins = 30, fill = "#3498db", colour = "white", linewidth = 0.3) +
+  geom_vline(aes(xintercept = mean(dist_sl_km)),   colour = "red",    linetype = "dashed", linewidth = 0.8) +
+  geom_vline(aes(xintercept = median(dist_sl_km)), colour = "orange", linetype = "dashed", linewidth = 0.8) +
+  annotate("text", x = mean(cbs$dist_sl_km) + 0.5, y = Inf,
+           label = sprintf("Mean: %.2f km", mean(cbs$dist_sl_km)),
+           vjust = 2, colour = "red", size = 3.5) +
+  annotate("text", x = median(cbs$dist_sl_km) + 0.5, y = Inf,
+           label = sprintf("Median: %.2f km", median(cbs$dist_sl_km)),
+           vjust = 4, colour = "orange", size = 3.5) +
+  labs(title = "Straight-Line Distance", x = "Distance (km)", y = "CBS Squares") +
+  theme_minimal(base_size = 11)
+
+# -- Histogram: network ----------------------------------------------------
+p_net <- ggplot(valid, aes(x = dist_net_km)) +
+  geom_histogram(bins = 30, fill = "#2ecc71", colour = "white", linewidth = 0.3) +
+  geom_vline(aes(xintercept = mean(dist_net_km)),   colour = "red",    linetype = "dashed", linewidth = 0.8) +
+  geom_vline(aes(xintercept = median(dist_net_km)), colour = "orange", linetype = "dashed", linewidth = 0.8) +
+  annotate("text", x = mean(valid$dist_net_km) + 0.2, y = Inf,
+           label = sprintf("Mean: %.2f km", mean(valid$dist_net_km)),
+           vjust = 2, colour = "red", size = 3.5) +
+  annotate("text", x = median(valid$dist_net_km) + 0.2, y = Inf,
+           label = sprintf("Median: %.2f km", median(valid$dist_net_km)),
+           vjust = 4, colour = "orange", size = 3.5) +
+  labs(title = "Network Distance", x = "Distance (km)", y = "CBS Squares") +
+  theme_minimal(base_size = 11)
+
+# -- Histogram: detour factor ----------------------------------------------
+p_detour <- ggplot(valid, aes(x = detour_factor)) +
+  geom_histogram(bins = 25, fill = "#e74c3c", colour = "white", linewidth = 0.3) +
+  geom_vline(aes(xintercept = mean(detour_factor, na.rm=TRUE)),
+             colour = "navy", linetype = "dashed", linewidth = 0.8) +
+  annotate("text", x = mean(valid$detour_factor, na.rm=TRUE) + 0.05, y = Inf,
+           label = sprintf("Mean: %.2fx", mean(valid$detour_factor, na.rm=TRUE)),
+           vjust = 2, colour = "navy", size = 3.5) +
+  labs(title = "Detour Factor (Network ÷ Straight-Line)",
+       x = "Detour factor (×)", y = "CBS Squares") +
+  theme_minimal(base_size = 11)
+
+p_dist <- p_sl | p_net | p_detour
+ggsave("02_distance_distributions.png", p_dist, width = 16, height = 5, dpi = 150)
+cat("  Saved -> 02_distance_distributions.png\n")
+
+# -- Spatial map coloured by network distance ------------------------------
+p_spatial <- ggplot() +
+  geom_segment(data = edge_df,
+               aes(x = x1, y = y1, xend = x2, yend = y2),
+               colour = "#334455", linewidth = 0.25, alpha = 0.5) +
+  geom_point(data = cbs, aes(x = x, y = y, colour = dist_net_km),
+             size = 2.5, alpha = 0.85) +
+  scale_colour_gradientn(colours = c("#2ecc71","#f1c40f","#e74c3c"),
+                         name = "Network dist\nto nearest SP (km)",
+                         na.value = "grey50") +
+  geom_point(data = sp, aes(x = x, y = y),
+             colour = "#ff4757", size = 4, shape = 8, stroke = 1.2) +
+  theme_void() +
+  theme(
+    plot.background  = element_rect(fill = "#1a1a2e", colour = NA),
+    panel.background = element_rect(fill = "#1a1a2e", colour = NA),
+    legend.text      = element_text(colour = "white"),
+    legend.title     = element_text(colour = "white"),
+    plot.title       = element_text(colour = "white", size = 13, hjust = 0.5)
+  ) +
+  labs(title = "CBS Squares — Network Distance to Nearest Service Point")
+
+ggsave("03_spatial_distance_map.png", p_spatial, width = 12, height = 12, dpi = 150)
+cat("  Saved -> 03_spatial_distance_map.png\n")
+
+# -- Catchment size per service point ------------------------------------─
+catchment <- cbs %>%
+  filter(!is.na(nearest_sp_net)) %>%
+  count(nearest_sp_net, name = "n_squares") %>%
+  arrange(n_squares) %>%
+  mutate(nearest_sp_net = factor(nearest_sp_net, levels = nearest_sp_net))
+
+p_catchment <- ggplot(catchment, aes(x = n_squares, y = nearest_sp_net)) +
+  geom_col(fill = "#3498db", alpha = 0.85) +
+  geom_text(aes(label = n_squares), hjust = -0.2, size = 3) +
+  labs(title = "Catchment Size per Service Point",
+       x = "Number of CBS Squares", y = "Service Point ID") +
+  theme_minimal(base_size = 10) +
+  expand_limits(x = max(catchment$n_squares) * 1.1)
+
+ggsave("04_catchment_per_sp.png", p_catchment, width = 10, height = 8, dpi = 150)
+cat("  Saved -> 04_catchment_per_sp.png\n")
+```
+```{r}
+# -----------------------------------------------------------------------
+# 7. SAVE SUMMARY CSV
+# -----------------------------------------------------------------------
+summary_df <- cbs %>%
+  select(square, x, y, Population,
+         nearest_sp_sl, dist_sl_km,
+         nearest_sp_net, dist_net_km, detour_factor)
+
+colnames(summary_df) <- c("CBS_square", "x", "y", "Population",
+                           "nearest_SP_straightline", "dist_straightline_km",
+                           "nearest_SP_network",      "dist_network_km",
+                           "detour_factor")
+
+write.csv(summary_df, "05_cbs_nearest_sp_distances.csv", row.names = FALSE)
+cat("  Saved -> 05_cbs_nearest_sp_distances.csv\n")
+
+cat("\nTop 5 CBS squares farthest from any service point (network):\n")
+print(summary_df %>% arrange(desc(dist_network_km)) %>%
+        select(CBS_square, Population, nearest_SP_network, dist_network_km, detour_factor) %>%
+        head(5))
+
+cat("\nDone! All outputs saved to working directory.\n")
+```
+## Descriptive statistics on distances 
+
+```{r}
+# Basic summary statistics
+dist_summary <- cbs %>%
+  filter(!is.na(dist_net_km)) %>%
+  summarise(
+    mean_km   = round(mean(dist_net_km), 2),
+    median_km = round(median(dist_net_km), 2),
+    min_km    = round(min(dist_net_km), 2),
+    max_km    = round(max(dist_net_km), 2),
+    sd_km     = round(sd(dist_net_km), 2)
+  )
+
+print(dist_summary)
+```
+
+## % of squares within distance thresholds
+
+```{r}
+threshold_summary <- cbs %>%
+  filter(!is.na(dist_net_km)) %>%
+  summarise(
+    pct_within_1km = round(mean(dist_net_km <= 1) * 100, 1),
+    pct_within_2km = round(mean(dist_net_km <= 2) * 100, 1),
+    pct_within_3km = round(mean(dist_net_km <= 3) * 100, 1),
+    pct_over_3km   = round(mean(dist_net_km >  3) * 100, 1)
+  )
+
+print(threshold_summary)
+```
+## Population-weighted mean distance
+
+```{r}
+weighted_summary <- cbs %>%
+  filter(!is.na(dist_net_km), !is.na(Population), Population > 0) %>%
+  summarise(
+    weighted_mean_km   = round(weighted.mean(dist_net_km, Population), 2),
+    pct_within_1km_pop = round(weighted.mean(dist_net_km <= 1, Population) * 100, 1),
+    pct_within_2km_pop = round(weighted.mean(dist_net_km <= 2, Population) * 100, 1),
+    pct_over_3km_pop   = round(weighted.mean(dist_net_km >  3, Population) * 100, 1)
+  )
+
+print(weighted_summary)
+```
+## Straight-line vs network comparison
+
+```{r}
+distance_comparison <- cbs %>%
+  filter(!is.na(dist_net_km), !is.na(dist_sl_km)) %>%
+  summarise(
+    mean_straightline_km = round(mean(dist_sl_km), 2),
+    mean_network_km      = round(mean(dist_net_km), 2),
+    mean_detour_factor   = round(mean(detour_factor, na.rm = TRUE), 2),
+    median_detour_factor = round(median(detour_factor, na.rm = TRUE), 2),
+    max_detour_factor    = round(max(detour_factor, na.rm = TRUE), 2)
+  )
+
+print(distance_comparison)
+
+# Scatter plot: straight-line vs network distance
+ggplot(cbs, aes(x = dist_sl_km, y = dist_net_km)) +
+  geom_point(alpha = 0.6, colour = "#3498db") +
+  geom_abline(slope = 1, intercept = 0, colour = "red",
+              linetype = "dashed", linewidth = 0.8) +
+  labs(
+    title    = "Straight-Line vs Network Distance to Nearest Service Point",
+    subtitle = "Points above the red line = road layout adds extra distance",
+    x        = "Straight-line distance (km)",
+    y        = "Network distance (km)"
+  ) +
+  theme_minimal()
+
+ggsave("06_straightline_vs_network.png", width = 8, height = 6, dpi = 150)
+```
+
+## Histogram of network distances
+
+```{r}
+ggplot(cbs %>% filter(!is.na(dist_net_km)), aes(x = dist_net_km)) +
+  geom_histogram(bins = 30, fill = "#eB8350", colour = "white", linewidth = 0.3) +
+  geom_vline(xintercept = mean(cbs$dist_net_km, na.rm = TRUE),
+             colour = "red", linetype = "dashed", linewidth = 0.9) +
+  geom_vline(xintercept = median(cbs$dist_net_km, na.rm = TRUE),
+             colour = "orange", linetype = "dashed", linewidth = 0.9) +
+  annotate("text", x = mean(cbs$dist_net_km, na.rm=TRUE) + 0.15, y = Inf,
+           label = sprintf("Mean: %.2f km", mean(cbs$dist_net_km, na.rm=TRUE)),
+           vjust = 2, colour = "red", size = 3.5) +
+  annotate("text", x = median(cbs$dist_net_km, na.rm=TRUE) + 0.15, y = Inf,
+           label = sprintf("Median: %.2f km", median(cbs$dist_net_km, na.rm=TRUE)),
+           vjust = 4, colour = "orange", size = 3.5) +
+  labs(
+    title = "Distribution of Network Distances to Nearest Service Point",
+    x     = "Network distance (km)",
+    y     = "Number of CBS squares"
+  ) +
+  theme_minimal()
+
+ggsave("07_distance_histogram.png", width = 9, height = 5, dpi = 150)
+```
+
+## Table of top 10 farthest squares
+
+```{r}
+top10_farthest <- cbs %>%
+  filter(!is.na(dist_net_km)) %>%
+  arrange(desc(dist_net_km)) %>%
+  select(square, Population, nearest_sp_net, dist_net_km, dist_sl_km, detour_factor) %>%
+  mutate(
+    dist_net_km    = round(dist_net_km, 2),
+    dist_sl_km     = round(dist_sl_km, 2),
+    detour_factor  = round(detour_factor, 2)
+  ) %>%
+  head(10)
+
+print(top10_farthest)
+```
+
+## Flag high-population squares that are far away
+
+```{r}
+# Squares that are both densely populated AND far from a service point
+underserved <- cbs %>%
+  filter(!is.na(dist_net_km), !is.na(Population), Population > 0) %>%
+  filter(dist_net_km > 2) %>%
+  arrange(desc(Population)) %>%
+  select(square, Population, nearest_sp_net, dist_net_km) %>%
+  mutate(dist_net_km = round(dist_net_km, 2)) %>%
+  head(10)
+
+print(underserved)
+```
+
+## Furthest Service Points 
+
+```{r}
+# -----------------------------------------------------------------------
+# Categorise squares by distance
+# -----------------------------------------------------------------------
+cbs_plot <- cbs %>%
+  filter(!is.na(dist_net_km), !is.na(x), !is.na(y)) %>%
+  mutate(
+    distance_category = case_when(
+      dist_net_km <= 1   ~ "Within 1 km",
+      dist_net_km <= 2   ~ "1 - 2 km",
+      dist_net_km <= 3   ~ "2 - 3 km",
+      dist_net_km >  3   ~ "Over 3 km"
+    ),
+    distance_category = factor(distance_category,
+                                levels = c("Within 1 km", "1 - 2 km",
+                                           "2 - 3 km",   "Over 3 km"))
+  )
+
+# Top 10 farthest squares with population for labelling
+top_far <- cbs_plot %>%
+  arrange(desc(dist_net_km)) %>%
+  head(10) %>%
+  mutate(label = paste0(square, "\n", round(dist_net_km, 1), " km"))
+
+# Underserved: populated AND far
+underserved <- cbs_plot %>%
+  filter(!is.na(Population), Population > 0, dist_net_km > 3) %>%
+  arrange(desc(Population)) %>%
+  head(5) %>%
+  mutate(label = paste0(square, "\n", Population, " residents"))
+
+# -----------------------------------------------------------------------
+# Plot
+# -----------------------------------------------------------------------
+p <- ggplot() +
+  
+  # Road network edges (light background)
+  geom_segment(data = edge_df,
+               aes(x = x1, y = y1, xend = x2, yend = y2),
+               colour = "#2a2a3a", linewidth = 0.2, alpha = 0.6) +
+  
+  # All CBS squares coloured by distance category
+  geom_point(data = cbs_plot,
+             aes(x = x, y = y,
+                 colour = distance_category,
+                 size   = ifelse(is.na(Population), 1, Population)),
+             alpha = 0.85) +
+  
+  # Service points as red stars
+  geom_point(data = sp,
+             aes(x = x, y = y),
+             colour = "white", fill = "#ff4757",
+             shape = 23, size = 4, stroke = 0.8) +
+  
+  # Label top 10 farthest squares
+  geom_label_repel(data = top_far,
+                   aes(x = x, y = y, label = label),
+                   colour = "white", fill = "#c0392b",
+                   size = 2.5, alpha = 0.9,
+                   box.padding = 0.4,
+                   max.overlaps = 20) +
+  
+  # Label underserved (populated + far) in orange
+  geom_label_repel(data = underserved,
+                   aes(x = x, y = y, label = label),
+                   colour = "white", fill = "#e67e22",
+                   size = 2.5, alpha = 0.9,
+                   box.padding = 0.4,
+                   max.overlaps = 20) +
+  
+  # Colour scale
+  scale_colour_manual(
+    values = c(
+      "Within 1 km" = "#2ecc71",
+      "1 - 2 km"    = "#f1c40f",
+      "2 - 3 km"    = "#e67e22",
+      "Over 3 km"   = "#e74c3c"
+    ),
+    name = "Distance to\nnearest SP"
+  ) +
+  
+  scale_size_continuous(
+    range = c(1.5, 6),
+    name  = "Population",
+    guide = guide_legend(override.aes = list(colour = "white"))
+  ) +
+  
+  # Dark map theme
+  theme_void() +
+  theme(
+    plot.background  = element_rect(fill = "#1a1a2e", colour = NA),
+    panel.background = element_rect(fill = "#1a1a2e", colour = NA),
+    legend.background = element_rect(fill = "#2d2d2d", colour = NA),
+    legend.text  = element_text(colour = "white", size = 8),
+    legend.title = element_text(colour = "white", size = 9),
+    plot.title   = element_text(colour = "white", size = 14,
+                                hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(colour = "#aaaaaa", size = 10,
+                                 hjust = 0.5),
+    plot.caption  = element_text(colour = "#888888", size = 8,
+                                 hjust = 0.5)
+  ) +
+  
+  labs(
+    title    = "CBS Square Accessibility — Distance to Nearest Service Point",
+    subtitle = "Red labels = 10 farthest squares  |  Orange labels = most populated squares over 3 km  |  Diamonds = service points",
+    caption  = "SP 5820 catchment dominates the underserved area in the north-east"
+  )
+
+ggsave("08_accessibility_map.png", p, width = 14, height = 13, dpi = 150)
+print(p)
+```
+
+```{r}
+# -----------------------------------------------------------------------
+# Highlight only the 4 most underserved squares
+# -----------------------------------------------------------------------
+
+# Define the 4 squares manually
+highlight_squares <- data.frame(
+  square     = c("E1800N3220", "E1805N3215", "E1805N3220", "E1810N3215"),
+  Population = c(1125, 1115, 945, 815),
+  dist_net_km = c(4.20, 4.60, 4.59, 4.75),
+  nearest_sp  = c(5820, 5820, 5820, 5820)
+) %>%
+  left_join(cbs %>% select(square, x, y), by = "square") %>%
+  mutate(label = paste0(square, "\n", Population, " residents\n", dist_net_km, " km"))
+
+# SP 5820 coordinates for highlighting
+sp5820 <- sp %>% filter(sp_id == 5820)
+
+# -----------------------------------------------------------------------
+# Plot
+# -----------------------------------------------------------------------
+p_highlight <- ggplot() +
+  
+  # Road network background
+  geom_segment(data = edge_df,
+               aes(x = x1, y = y1, xend = x2, yend = y2),
+               colour = "#2a2a3a", linewidth = 0.2, alpha = 0.6) +
+  
+  # All CBS squares in grey as background context
+  geom_point(data = cbs %>% filter(!is.na(x), !is.na(y)),
+             aes(x = x, y = y),
+             colour = "#555577", size = 1.5, alpha = 0.4) +
+  
+  # All service points in white
+  geom_point(data = sp,
+             aes(x = x, y = y),
+             colour = "white", shape = 8, size = 3, stroke = 0.8) +
+  
+  # SP 5820 highlighted in red
+  geom_point(data = sp5820,
+             aes(x = x, y = y),
+             colour = "#ff4757", shape = 8, size = 6, stroke = 1.5) +
+  
+  # Draw lines from SP 5820 to each highlighted square
+  geom_segment(data = highlight_squares,
+               aes(x = sp5820$x, y = sp5820$y, xend = x, yend = y),
+               colour = "#e67e22", linewidth = 0.8,
+               linetype = "dashed", alpha = 0.7) +
+  
+  # The 4 highlighted squares in orange
+  geom_point(data = highlight_squares,
+             aes(x = x, y = y, size = Population),
+             colour = "#e67e22", alpha = 0.9) +
+  
+  # Labels for the 4 squares
+  geom_label_repel(data = highlight_squares,
+                   aes(x = x, y = y, label = label),
+                   colour = "white", fill = "#c0392b",
+                   size = 3, fontface = "bold",
+                   box.padding  = 0.6,
+                   point.padding = 0.3,
+                   max.overlaps = 20) +
+  
+  # Label SP 5820
+  geom_label_repel(data = sp5820,
+                   aes(x = x, y = y, label = "SP 5820"),
+                   colour = "white", fill = "#ff4757",
+                   size = 3.5, fontface = "bold",
+                   box.padding = 0.5) +
+  
+  scale_size_continuous(range = c(4, 9), name = "Population") +
+  
+  theme_void() +
+  theme(
+    plot.background   = element_rect(fill = "#1a1a2e", colour = NA),
+    panel.background  = element_rect(fill = "#1a1a2e", colour = NA),
+    legend.background = element_rect(fill = "#2d2d2d", colour = NA),
+    legend.text  = element_text(colour = "white", size = 9),
+    legend.title = element_text(colour = "white", size = 10),
+    plot.title   = element_text(colour = "white", size = 14,
+                                hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(colour = "#aaaaaa", size = 10,
+                                 hjust = 0.5),
+    plot.caption  = element_text(colour = "#e67e22", size = 9,
+                                 hjust = 0.5)
+  ) +
+  
+  labs(
+    title    = "Most Underserved Populated Squares — All Served by SP 5820",
+    subtitle = "Orange = underserved squares  |  Red star = SP 5820  |  White stars = other service points",
+    caption  = "Combined population of 3,985 residents living 4.2 - 4.8 km from their nearest service point"
+  )
+
+ggsave("09_underserved_highlight.png", p_highlight,
+       width = 13, height = 12, dpi = 150)
+print(p_highlight)
+```
+

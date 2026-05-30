@@ -1,0 +1,13 @@
+metric,value
+Annual deliveries,482442.0
+Annual pickups,869410.0
+Annual total parcels,1351852.0
+Average deliveries per day,1321.7589041095891
+Average pickups per day,2381.945205479452
+Average total parcels per day,3703.7041095890413
+Median total parcels per day,4101.0
+90th percentile total parcels per day,5278.4
+95th percentile total parcels per day,5759.8
+Maximum total parcels in one day,8259.0
+Average pickup share,0.6431251349999852
+Average delivery share,0.3568748650000148

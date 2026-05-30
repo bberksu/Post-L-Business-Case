@@ -1,0 +1,19 @@
+
+Daily Demand Patterns EDA - Key Findings
+========================================
+
+1. Demand baseline
+In 2025, Maastricht generated 1,351,852 parcel activities in total.
+This consisted of 482,442 deliveries and 869,410 pickups.
+The average daily parcel demand was 3,703.7 parcels per day.
+
+2. Pickup vs delivery split
+The annual pickup share was 64.31%, while the delivery share was 35.69%.
+This provides a first baseline for the consumer behavior model. Later, this baseline can be adjusted based on distance to the nearest service point.
+
+3. Capacity relevance
+The median daily demand was 4,101.0, while the 95th percentile daily demand was 5,759.8.
+This suggests that capacity planning should not rely only on the average day. High-demand days are more relevant when trying to keep bounce rates low.
+
+4. Modelling implication
+The historical daily activity data can be used as the city-wide demand baseline for 2025. For the optimization model, demand can then be distributed across CBS squares and assigned to service points based on distance.

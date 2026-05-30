@@ -1,0 +1,478 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+import networkx as nx
+from scipy.optimize import curve_fit
+import warnings
+warnings.filterwarnings("ignore")
+
+DATA_PATH   = "C:/Users/Dirk/OneDrive/Desktop/data_Maastricht_2025.xlsx"
+OUTPUT_DIR  = "C:/Users/Dirk/OneDrive/Desktop/"
+
+COST_PER_KM      = 1.50   # € per km for home delivery
+FIXED_PER_SP     = 50_000 # € per service point per year
+STORAGE_PER_PKG  = 0.10   # € per package per day in storage
+AVG_DWELL_DAYS   = 2      # assumed average days a package waits at SP
+
+# =============================================================================
+# 0. LOAD DATA
+# =============================================================================
+xl    = pd.ExcelFile(DATA_PATH)
+sp    = pd.read_excel(xl, "Service Point Locations")
+da    = pd.read_excel(xl, "Daily Activity")
+nodes = pd.read_excel(xl, "Nodes")
+edges = pd.read_excel(xl, "Edges")
+
+da["Date"] = pd.to_datetime(da["Date"])
+da["dow"]  = da["Date"].dt.day_name()
+da["month"]= da["Date"].dt.month
+
+print(f"Loaded: {len(sp)} service points, {len(da):,} daily records, "
+      f"{len(nodes):,} nodes, {len(edges):,} edges")
+
+# =============================================================================
+# 1. COMPUTE ROAD-NETWORK DISTANCES  (SP → catchment squares)
+# =============================================================================
+# Build graph
+G = nx.Graph()
+for _, r in nodes.iterrows():
+    G.add_node(int(r["NODE ID"]), x=r["X"], y=r["Y"])
+for _, r in edges.iterrows():
+    G.add_edge(int(r["V1"]), int(r["V2"]), weight=float(r["DIST"]))
+
+# Keep largest connected component
+G = G.subgraph(max(nx.connected_components(G), key=len)).copy()
+
+node_coords = np.array([[G.nodes[n]["x"], G.nodes[n]["y"]] for n in G.nodes()])
+node_ids    = np.array(list(G.nodes()))
+
+def nearest_node(x, y):
+    diffs = node_coords - np.array([x, y])
+    return node_ids[np.argmin((diffs**2).sum(axis=1))]
+
+sp["node"] = sp.apply(lambda r: nearest_node(r["X"], r["Y"]), axis=1)
+
+cbs = pd.read_excel(xl, "CBS Squares")
+cbs_pop = cbs[cbs["Population"].notna()].copy()
+cbs_pop["node"] = cbs_pop.apply(lambda r: nearest_node(r["X"], r["Y"]), axis=1)
+
+print("Running Dijkstra from each service point…")
+sp_dist_maps = {}
+for _, row in sp.iterrows():
+    sp_dist_maps[row["Location ID"]] = nx.single_source_dijkstra_path_length(
+        G, row["node"], weight="weight"
+    )
+
+sp_ids = sp["Location ID"].tolist()
+dist_matrix = np.full((len(cbs_pop), len(sp_ids)), np.inf)
+for j, sid in enumerate(sp_ids):
+    dmap = sp_dist_maps[sid]
+    for i, n in enumerate(cbs_pop["node"].values):
+        dist_matrix[i, j] = dmap.get(int(n), np.inf)
+
+nearest_idx              = np.argmin(dist_matrix, axis=1)
+cbs_pop["nearest_sp"]    = [sp_ids[k] for k in nearest_idx]
+cbs_pop["dist_to_sp_m"]  = dist_matrix[np.arange(len(cbs_pop)), nearest_idx]
+cbs_pop["dist_to_sp_km"] = cbs_pop["dist_to_sp_m"] / 1000.0
+
+# Weighted average delivery distance per SP (pop-weighted)
+def avg_catchment_dist(sp_id):
+    sub = cbs_pop[cbs_pop["nearest_sp"] == sp_id]
+    if sub.empty or sub["Population"].sum() == 0:
+        return np.nan
+    return np.average(sub["dist_to_sp_km"], weights=sub["Population"])
+
+sp["avg_dist_km"] = sp["Location ID"].apply(avg_catchment_dist)
+
+# =============================================================================
+# 2. ANNUAL ACTIVITY PER SERVICE POINT
+# =============================================================================
+annual = da.groupby("Location ID").agg(
+    total_deliveries=("Deliveries", "sum"),
+    total_pickups   =("Pickups",    "sum"),
+    active_days     =("Date",       "count"),
+).reset_index()
+
+annual["total_parcels"]  = annual["total_deliveries"] + annual["total_pickups"]
+annual["pickup_rate"]    = annual["total_pickups"] / annual["total_parcels"]
+annual["avg_daily_del"]  = annual["total_deliveries"] / annual["active_days"]
+annual["avg_daily_pick"] = annual["total_pickups"]    / annual["active_days"]
+annual["avg_daily_tot"]  = annual["total_parcels"]    / annual["active_days"]
+
+df = sp.merge(annual, on="Location ID")
+
+# =============================================================================
+# 3. COST ESTIMATION
+# =============================================================================
+# 3a. Delivery cost: volume-weighted by road distance
+df["delivery_cost"] = df["total_deliveries"] * df["avg_dist_km"] * COST_PER_KM
+
+# 3b. Fixed cost: same for every SP
+df["fixed_cost"] = float(FIXED_PER_SP)
+
+# 3c. Storage cost: pickups × dwell × daily rate
+df["storage_cost"] = df["total_pickups"] * AVG_DWELL_DAYS * STORAGE_PER_PKG
+
+# 3d. Total
+df["total_cost"] = df["delivery_cost"] + df["fixed_cost"] + df["storage_cost"]
+df["cost_per_parcel"] = df["total_cost"] / df["total_parcels"]
+
+# Network-level summary
+total_delivery = df["delivery_cost"].sum()
+total_fixed    = df["fixed_cost"].sum()
+total_storage  = df["storage_cost"].sum()
+total_cost     = df["total_cost"].sum()
+
+print("\n" + "="*55)
+print("  ANNUAL COST SUMMARY")
+print("="*55)
+print(f"  Delivery (€{COST_PER_KM}/km):          €{total_delivery:>10,.0f}  ({total_delivery/total_cost:.1%})")
+print(f"  Fixed (35 × €{FIXED_PER_SP:,}):     €{total_fixed:>10,.0f}  ({total_fixed/total_cost:.1%})")
+print(f"  Storage (€{STORAGE_PER_PKG}/pkg/day × {AVG_DWELL_DAYS}d): €{total_storage:>10,.0f}  ({total_storage/total_cost:.1%})")
+print(f"  TOTAL:                        €{total_cost:>10,.0f}")
+print("="*55)
+
+# Counterfactual: what if all parcels were delivered at home?
+df["cost_all_delivery"]   = df["total_parcels"] * df["avg_dist_km"] * COST_PER_KM + FIXED_PER_SP
+df["pickup_channel_saving"] = df["cost_all_delivery"] - df["total_cost"]
+net_pickup_saving = df["pickup_channel_saving"].sum()
+print(f"\n  Net saving from pickup channel: €{net_pickup_saving:,.0f}/yr")
+print(f"  (Each pickup avoids avg. €{df['total_deliveries'].sum() * df['avg_dist_km'].mean() * COST_PER_KM / df['total_deliveries'].sum():.2f} delivery "
+      f"but adds €{AVG_DWELL_DAYS * STORAGE_PER_PKG:.2f} storage)")
+
+# =============================================================================
+# 4. CAPACITY PRESSURE ANALYSIS
+# =============================================================================
+# Daily statistics per SP (pickups drive storage load)
+daily_sp = da.groupby(["Location ID", "Date"]).agg(
+    daily_pickups   =("Pickups",    "sum"),
+    daily_deliveries=("Deliveries", "sum"),
+).reset_index()
+daily_sp["daily_total"] = daily_sp["daily_pickups"] + daily_sp["daily_deliveries"]
+
+cap = daily_sp.groupby("Location ID").agg(
+    avg_pickups =("daily_pickups",  "mean"),
+    p90_pickups =("daily_pickups",  lambda x: x.quantile(0.90)),
+    p95_pickups =("daily_pickups",  lambda x: x.quantile(0.95)),
+    max_pickups =("daily_pickups",  "max"),
+    avg_total   =("daily_total",    "mean"),
+    max_total   =("daily_total",    "max"),
+    cv_pickups  =("daily_pickups",  lambda x: x.std() / x.mean()),  # variability
+).reset_index()
+
+cap["peak_ratio"]  = cap["max_pickups"]  / cap["avg_pickups"]  # max / avg
+cap["p95_ratio"]   = cap["p95_pickups"]  / cap["avg_pickups"]  # 95th pct / avg
+
+df = df.merge(cap, on="Location ID")
+
+# =============================================================================
+# 5. BOUNCE-RISK SCORING
+# =============================================================================
+# Bounce risk = package cannot be stored because SP is at/over capacity.
+# We don't have explicit capacity limits, so we proxy with:
+#   - High avg daily pickups (absolute load)
+#   - High peak-to-average ratio (variability / spikiness)
+#   - High coefficient of variation (unpredictable load)
+# Score each on a 0–1 scale, then combine.
+
+def minmax(series):
+    return (series - series.min()) / (series.max() - series.min() + 1e-9)
+
+df["score_volume"]   = minmax(df["avg_pickups"])   # high volume = bad
+df["score_spikes"]   = minmax(df["peak_ratio"])    # high spikes = bad
+df["score_variability"] = minmax(df["cv_pickups"]) # high CV = bad
+
+# Weighted composite (volume matters most)
+df["bounce_risk_score"] = (
+    0.50 * df["score_volume"] +
+    0.30 * df["score_spikes"] +
+    0.20 * df["score_variability"]
+)
+df["bounce_risk_label"] = pd.cut(
+    df["bounce_risk_score"],
+    bins=[0, 0.33, 0.66, 1.01],
+    labels=["Low", "Medium", "High"]
+)
+
+print("\nBounce-Risk Table (top 10):")
+bounce_cols = ["Location ID", "avg_pickups", "max_pickups", "peak_ratio",
+               "cv_pickups", "bounce_risk_score", "bounce_risk_label"]
+print(df.sort_values("bounce_risk_score", ascending=False)[bounce_cols]
+        .head(10).round(2).to_string(index=False))
+
+# =============================================================================
+# 6. PLOTS
+# =============================================================================
+COLORS = {
+    "navy":   "#1A3E6A",
+    "teal":   "#028090",
+    "coral":  "#E8603C",
+    "gold":   "#F5A623",
+    "gray":   "#64748B",
+    "light":  "#E2E8F0",
+}
+
+# ── Plot 1: Annual cost breakdown (bar + donut) ─────────────────────────────
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+fig.suptitle("Part 6 — Annual Cost Breakdown", fontsize=14, fontweight="bold",
+             color=COLORS["navy"])
+
+# Stacked bar per SP (sorted by total cost)
+df_plot = df.sort_values("total_cost", ascending=False).head(20)
+ax = axes[0]
+bar_w = 0.65
+idx = np.arange(len(df_plot))
+b1 = ax.bar(idx, df_plot["delivery_cost"], bar_w, color=COLORS["coral"],  label="Delivery (€1.50/km)")
+b2 = ax.bar(idx, df_plot["fixed_cost"],    bar_w, bottom=df_plot["delivery_cost"], color=COLORS["navy"],  label=f"Fixed (€{FIXED_PER_SP:,}/SP/yr)")
+b3 = ax.bar(idx, df_plot["storage_cost"],  bar_w,
+            bottom=df_plot["delivery_cost"] + df_plot["fixed_cost"],
+            color=COLORS["gold"],  label=f"Storage (€{STORAGE_PER_PKG}/pkg/day)")
+ax.set_xticks(idx)
+ax.set_xticklabels([f"SP {int(x)}" for x in df_plot["Location ID"]], rotation=45, ha="right", fontsize=7)
+ax.set_ylabel("Annual cost (€)")
+ax.set_title("Cost per Service Point (top 20 by total cost)", fontsize=10)
+ax.legend(fontsize=8)
+ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"€{x/1000:.0f}k"))
+ax.spines[["top", "right"]].set_visible(False)
+
+# Donut: network-level cost mix
+ax2 = axes[1]
+sizes  = [total_delivery, total_fixed, total_storage]
+labels = [f"Delivery\n€{total_delivery/1e3:.0f}k ({total_delivery/total_cost:.0%})",
+          f"Fixed\n€{total_fixed/1e3:.0f}k ({total_fixed/total_cost:.0%})",
+          f"Storage\n€{total_storage/1e3:.0f}k ({total_storage/total_cost:.0%})"]
+colors = [COLORS["coral"], COLORS["navy"], COLORS["gold"]]
+wedges, texts = ax2.pie(sizes, labels=labels, colors=colors,
+                        wedgeprops=dict(width=0.5, edgecolor="white", linewidth=1.5),
+                        startangle=90, textprops={"fontsize": 9})
+ax2.text(0, 0, f"€{total_cost/1e6:.2f}M\ntotal", ha="center", va="center",
+         fontsize=11, fontweight="bold", color=COLORS["navy"])
+ax2.set_title("Network-wide Cost Mix", fontsize=10)
+
+plt.tight_layout()
+plt.savefig(OUTPUT_DIR + "p6_01_cost_breakdown.png", dpi=150, bbox_inches="tight")
+plt.close()
+print("\nSaved: p6_01_cost_breakdown.png")
+
+# ── Plot 2: Cost per parcel vs. avg distance ────────────────────────────────
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+fig.suptitle("Part 6 — Delivery Cost Drivers", fontsize=14, fontweight="bold",
+             color=COLORS["navy"])
+
+ax = axes[0]
+sc = ax.scatter(df["avg_dist_km"], df["delivery_cost"],
+                c=df["total_deliveries"], cmap="YlOrRd",
+                s=80, edgecolors=COLORS["gray"], linewidths=0.5)
+# Annotate outlier SP 5820
+outlier = df[df["avg_dist_km"] > 2.0]
+for _, row in outlier.iterrows():
+    ax.annotate(f"SP {int(row['Location ID'])}\n({row['avg_dist_km']:.2f} km)",
+                xy=(row["avg_dist_km"], row["delivery_cost"]),
+                xytext=(row["avg_dist_km"] - 0.8, row["delivery_cost"] - 20000),
+                fontsize=8, color=COLORS["coral"], fontweight="bold",
+                arrowprops=dict(arrowstyle="->", color=COLORS["coral"], lw=1))
+cbar = plt.colorbar(sc, ax=ax)
+cbar.set_label("Annual deliveries", fontsize=8)
+ax.set_xlabel("Avg. road distance to SP (km)")
+ax.set_ylabel("Annual delivery cost (€)")
+ax.set_title("Delivery Cost vs. Distance\n(color = delivery volume)", fontsize=10)
+ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"€{x/1000:.0f}k"))
+ax.spines[["top", "right"]].set_visible(False)
+
+ax2 = axes[1]
+ax2.scatter(df["total_parcels"], df["cost_per_parcel"],
+            color=COLORS["teal"], s=80, edgecolors=COLORS["gray"], linewidths=0.5)
+for _, row in df.nlargest(3, "cost_per_parcel").iterrows():
+    ax2.annotate(f"SP {int(row['Location ID'])}",
+                 xy=(row["total_parcels"], row["cost_per_parcel"]),
+                 xytext=(row["total_parcels"] + 3000, row["cost_per_parcel"]),
+                 fontsize=8, color=COLORS["navy"])
+ax2.axhline(df["cost_per_parcel"].mean(), color=COLORS["coral"],
+            linestyle="--", linewidth=1.2,
+            label=f"Network avg: €{df['cost_per_parcel'].mean():.2f}")
+ax2.set_xlabel("Annual parcel volume")
+ax2.set_ylabel("Cost per parcel (€)")
+ax2.set_title("Cost Efficiency: Cost per Parcel vs. Volume\n(low volume + high dist = expensive)", fontsize=10)
+ax2.legend(fontsize=8)
+ax2.spines[["top", "right"]].set_visible(False)
+
+plt.tight_layout()
+plt.savefig(OUTPUT_DIR + "p6_02_cost_drivers.png", dpi=150, bbox_inches="tight")
+plt.close()
+print("Saved: p6_02_cost_drivers.png")
+
+# ── Plot 3: Capacity pressure — avg vs peak daily pickups ──────────────────
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+fig.suptitle("Part 6 — Capacity Pressure per Service Point", fontsize=14,
+             fontweight="bold", color=COLORS["navy"])
+
+ax = axes[0]
+df_cap = df.sort_values("avg_pickups", ascending=False).head(20)
+x = np.arange(len(df_cap))
+ax.bar(x, df_cap["avg_pickups"], 0.6, color=COLORS["teal"],  label="Avg daily pickups", alpha=0.85)
+ax.bar(x, df_cap["p95_pickups"] - df_cap["avg_pickups"], 0.6,
+       bottom=df_cap["avg_pickups"], color=COLORS["gold"], alpha=0.7, label="Avg → P95 range")
+ax.bar(x, df_cap["max_pickups"] - df_cap["p95_pickups"], 0.6,
+       bottom=df_cap["p95_pickups"], color=COLORS["coral"], alpha=0.7, label="P95 → Max (spike)")
+ax.set_xticks(x)
+ax.set_xticklabels([f"SP {int(v)}" for v in df_cap["Location ID"]], rotation=45, ha="right", fontsize=7)
+ax.set_ylabel("Daily pickups (packages)")
+ax.set_title("Daily Pickup Load: Average, P95, and Peak\n(top 20 by avg load)", fontsize=10)
+ax.legend(fontsize=8)
+ax.spines[["top", "right"]].set_visible(False)
+
+ax2 = axes[1]
+colors_bounce = df.sort_values("avg_pickups", ascending=False).head(20)["bounce_risk_label"].map(
+    {"Low": COLORS["teal"], "Medium": COLORS["gold"], "High": COLORS["coral"]}
+)
+df_cap2 = df.sort_values("avg_pickups", ascending=False).head(20)
+sc2 = ax2.scatter(df_cap2["avg_pickups"], df_cap2["peak_ratio"],
+                  c=colors_bounce, s=120, edgecolors=COLORS["gray"], linewidths=0.6)
+for _, row in df_cap2.iterrows():
+    ax2.annotate(f"SP {int(row['Location ID'])}",
+                 xy=(row["avg_pickups"], row["peak_ratio"]),
+                 xytext=(row["avg_pickups"] + 3, row["peak_ratio"] + 0.02),
+                 fontsize=7, color=COLORS["navy"])
+ax2.axhline(2.0, color=COLORS["coral"], linestyle="--", linewidth=1,
+            label="2× peak-to-average threshold")
+ax2.set_xlabel("Avg daily pickups")
+ax2.set_ylabel("Peak-to-average ratio (max / avg)")
+ax2.set_title("Bounce-Risk Matrix: Volume vs. Spikiness\n(red = High, orange = Medium, teal = Low)", fontsize=10)
+ax2.legend(fontsize=8)
+ax2.spines[["top", "right"]].set_visible(False)
+
+plt.tight_layout()
+plt.savefig(OUTPUT_DIR + "p6_03_capacity_pressure.png", dpi=150, bbox_inches="tight")
+plt.close()
+print("Saved: p6_03_capacity_pressure.png")
+
+# ── Plot 4: Daily network pickup load — time series & weekday pattern ───────
+fig, axes = plt.subplots(1, 2, figsize=(14, 4))
+fig.suptitle("Part 6 — Network-wide Daily Pickup Load (Storage Demand)", fontsize=14,
+             fontweight="bold", color=COLORS["navy"])
+
+network_daily = da.groupby("Date")[["Pickups", "Deliveries"]].sum().reset_index()
+network_daily["storage_cost_day"] = network_daily["Pickups"] * AVG_DWELL_DAYS * STORAGE_PER_PKG
+
+ax = axes[0]
+ax.fill_between(network_daily["Date"], network_daily["Pickups"],
+                color=COLORS["teal"], alpha=0.4)
+ax.plot(network_daily["Date"], network_daily["Pickups"],
+        color=COLORS["teal"], linewidth=0.8)
+ax.axhline(network_daily["Pickups"].mean(), color=COLORS["coral"],
+           linestyle="--", linewidth=1.5,
+           label=f"Annual avg: {network_daily['Pickups'].mean():.0f} pkgs/day")
+ax.set_xlabel("Date")
+ax.set_ylabel("Daily network pickups")
+ax.set_title("Total Daily Pickups — All 35 SPs (2025)", fontsize=10)
+ax.legend(fontsize=8)
+ax.spines[["top", "right"]].set_visible(False)
+
+ax2 = axes[1]
+dow_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+dow_avg = da.groupby("dow")["Pickups"].mean().reindex(dow_order)
+bar_colors = [COLORS["coral"] if d in ["Monday","Tuesday"] else COLORS["teal"]
+              if d == "Sunday" else COLORS["gray"] for d in dow_order]
+ax2.bar(dow_order, dow_avg, color=bar_colors, edgecolor="white", linewidth=0.5)
+ax2.set_ylabel("Avg daily pickups (per SP)")
+ax2.set_title("Average Pickup Load by Day of Week\n(per service point)", fontsize=10)
+ax2.tick_params(axis="x", rotation=30)
+ax2.spines[["top", "right"]].set_visible(False)
+ax2.annotate("Closed\n(Sun = 0)", xy=(6, 1), ha="center", fontsize=8, color=COLORS["gray"])
+
+plt.tight_layout()
+plt.savefig(OUTPUT_DIR + "p6_04_daily_load.png", dpi=150, bbox_inches="tight")
+plt.close()
+print("Saved: p6_04_daily_load.png")
+
+# ── Plot 5: Bounce-risk ranking table (visual) ───────────────────────────────
+fig, ax = plt.subplots(figsize=(20, 14))
+ax.axis("off")
+
+table_df = df.sort_values("bounce_risk_score", ascending=False)[
+    ["Location ID", "avg_pickups", "max_pickups", "peak_ratio",
+     "cv_pickups", "delivery_cost", "total_cost", "bounce_risk_label"]
+].copy()
+table_df.columns = ["SP ID", "Avg Daily Pickups", "Max Daily Pickups",
+                    "Peak/Avg Ratio", "CV (Variability)",
+                    "Delivery Cost (€)", "Total Cost (€)", "Bounce Risk"]
+table_df = table_df.round({"Avg Daily Pickups": 0, "Max Daily Pickups": 0,
+                            "Peak/Avg Ratio": 2, "CV (Variability)": 2,
+                            "Delivery Cost (€)": 0, "Total Cost (€)": 0})
+
+row_colors = []
+for _, row in table_df.iterrows():
+    base = "#FFFFFF"
+    risk_color = {"High": "#FEE2E2", "Medium": "#FEF9C3", "Low": "#DCFCE7"}
+    row_colors.append([base]*7 + [risk_color.get(str(row["Bounce Risk"]), base)])
+
+tbl = ax.table(
+    cellText=table_df.values,
+    colLabels=table_df.columns,
+    cellLoc="center",
+    loc="center",
+    cellColours=row_colors,
+)
+tbl.auto_set_font_size(False)
+tbl.set_fontsize(11)
+tbl.scale(1, 2.0)
+
+col_widths = [0.08, 0.13, 0.13, 0.12, 0.13, 0.15, 0.13, 0.11]
+for (row, col), cell in tbl.get_celld().items():
+    if col >= 0:
+        cell.set_width(col_widths[col])
+    if row == 0:
+        cell.set_facecolor(COLORS["navy"])
+        cell.get_text().set_color("white")
+        cell.get_text().set_fontweight("bold")
+        cell.get_text().set_fontsize(11)
+
+plt.subplots_adjust(top=0.94)
+plt.savefig(OUTPUT_DIR + "p6_05_bounce_risk_table.png", dpi=150, bbox_inches="tight")
+plt.close()
+print("Saved: p6_05_bounce_risk_table.png")
+
+# =============================================================================
+# 7. SUMMARY OUTPUT
+# =============================================================================
+print("\n" + "="*60)
+print("  PART 6 EDA — KEY FINDINGS SUMMARY")
+print("="*60)
+
+high_risk = df[df["bounce_risk_label"] == "High"]
+med_risk  = df[df["bounce_risk_label"] == "Medium"]
+low_risk  = df[df["bounce_risk_label"] == "Low"]
+
+print(f"\n  Cost structure:")
+print(f"    Fixed costs dominate: {total_fixed/total_cost:.0%} of total budget")
+print(f"    Delivery costs:       {total_delivery/total_cost:.0%}  (driven by distance)")
+print(f"    Storage costs:        {total_storage/total_cost:.0%}  (driven by pickup volume)")
+
+print(f"\n  Outlier — SP 5820:")
+sp5820 = df[df["Location ID"] == 5820].iloc[0]
+print(f"    Avg delivery distance: {sp5820['avg_dist_km']:.2f} km")
+print(f"    Annual delivery cost:  €{sp5820['delivery_cost']:,.0f}")
+print(f"    vs. network median:    €{df['delivery_cost'].median():,.0f}")
+
+print(f"\n  Capacity pressure:")
+print(f"    High bounce-risk SPs:   {len(high_risk)} ({', '.join(str(int(x)) for x in high_risk['Location ID'])})")
+print(f"    Medium bounce-risk SPs: {len(med_risk)}")
+print(f"    Low bounce-risk SPs:    {len(low_risk)}")
+print(f"    Busiest SP (avg):       SP {int(df.loc[df['avg_pickups'].idxmax(),'Location ID'])} "
+      f"— {df['avg_pickups'].max():.0f} pickups/day (peak: {int(df['max_pickups'].max())})")
+print(f"    Network peak day:       {network_daily.loc[network_daily['Pickups'].idxmax(),'Date'].date()} "
+      f"— {network_daily['Pickups'].max():,} pickups across all SPs")
+
+print(f"\n  Weekday pattern:")
+dow_avg_full = da.groupby("dow")["Pickups"].mean().reindex(dow_order)
+print(f"    Busiest:  Tuesday  ({dow_avg_full['Tuesday']:.0f} avg pickups/SP/day)")
+print(f"    Quietest: Sunday   ({dow_avg_full['Sunday']:.0f} — closed)")
+print(f"    Mon–Tue spike means capacity needs to absorb ~"
+      f"{(dow_avg_full['Tuesday']/dow_avg_full[['Wednesday','Thursday','Friday']].mean() - 1):.0%} more than mid-week avg")
+
+print(f"\n  Cost efficiency range:")
+print(f"    Cheapest SP per parcel: €{df['cost_per_parcel'].min():.2f}  (SP {int(df.loc[df['cost_per_parcel'].idxmin(),'Location ID'])})")
+print(f"    Most expensive:         €{df['cost_per_parcel'].max():.2f}  (SP {int(df.loc[df['cost_per_parcel'].idxmax(),'Location ID'])})")
+print(f"    Network average:        €{df['cost_per_parcel'].mean():.2f}")
+print("="*60)

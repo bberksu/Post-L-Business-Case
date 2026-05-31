@@ -1,0 +1,335 @@
+---
+title: "EDA daily case 2"
+author: "Nicola"
+date: "2026-05-21"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# ================================
+# STEP 1: Load packages
+# ================================
+
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(janitor)
+
+
+# ================================
+# STEP 2: Load the relevant sheets
+# ================================
+
+service_points <- read_excel("C:/Users/nicol/OneDrive/universita/elab 2/data_Maastricht_2025.xlsx",
+                             sheet = "Service Point Locations") %>%
+  clean_names()
+
+daily_activity <- read_excel("C:/Users/nicol/OneDrive/universita/elab 2/data_Maastricht_2025.xlsx",
+                             sheet = "Daily Activity") %>%
+  clean_names()
+
+
+# ================================
+# STEP 3: Inspect the data
+# ================================
+
+glimpse(service_points)
+glimpse(daily_activity)
+
+head(service_points)
+head(daily_activity)
+
+
+# ================================
+# STEP 4: Basic checks
+# ================================
+
+nrow(service_points)
+n_distinct(service_points$location_id)
+
+nrow(daily_activity)
+n_distinct(daily_activity$location_id)
+
+summary(daily_activity$deliveries)
+summary(daily_activity$pickups)
+```
+Initial Data Inspection
+
+The dataset contains activity data for 35 service points in Maastricht over the entire year of 2025.
+The Daily Activity table consists of 12,775 observations, corresponding to daily pickup and delivery activity for each service point.
+
+The data appears to be complete and well-structured, with no immediate inconsistencies in the main variables. Both deliveries and pickups are stored as numeric variables, making the dataset suitable for aggregation and performance analysis.
+
+Initial descriptive statistics show substantial variation in service point activity levels. Daily deliveries range from 0 to 392 parcels, while daily pickups range from 0 to 688 parcels. Furthermore, pickup activity appears to be consistently higher than delivery activity on average:
+
+-Average daily deliveries per service point: approximately 37.8 parcels
+-Average daily pickups per service point: approximately 68.1 parcels
+
+This suggests that pickup operations play a dominant role within the current parcel network. In addition, the wide range between minimum and maximum values indicates that parcel activity is likely concentrated among a limited number of service points.
+
+The next step is therefore to aggregate parcel activity by service point in order to identify the busiest and least utilized locations in the network.
+
+```{r}
+# ================================
+# STEP 5: Service point summary
+# ================================
+
+service_point_summary <- daily_activity %>%
+group_by(location_id) %>%
+summarise(
+total_deliveries = sum(deliveries, na.rm = TRUE),
+total_pickups = sum(pickups, na.rm = TRUE)
+) %>%
+mutate(
+total_activity = total_deliveries + total_pickups,
+pickup_ratio = total_pickups / total_activity,
+delivery_ratio = total_deliveries / total_activity
+) %>%
+arrange(desc(total_activity))
+
+# View full table
+service_point_summary
+
+# Top 10 service points
+head(service_point_summary, 10)
+```
+Service Point Performance Analysis
+
+The aggregated activity analysis reveals substantial differences in parcel volume across the 35 service points in Maastricht.
+
+Parcel demand appears to be highly concentrated among a limited number of locations. The busiest service point (Location 4440) processes approximately 166,815 parcels annually, while the least active service point (Location 7422) handles only around 1,022 parcels per year. This large disparity suggests that the current network is not evenly balanced and that certain service points may experience significantly higher operational pressure than others.
+
+Furthermore, pickup activity dominates the majority of service points. For most locations, pickups account for more than 60% of total parcel activity. This finding is particularly important because customer pickups are substantially cheaper for Post&L than home deliveries. The strong reliance on pickup operations suggests that service points play a central role in reducing delivery costs within the current network structure.
+
+At the same time, several service points display noticeably higher delivery ratios, indicating potential differences in customer behavior, accessibility, or demographic characteristics across different areas of Maastricht.
+
+Finally, the presence of extremely low-volume service points may indicate underutilized locations within the network, which could become candidates for future optimization or relocation strategies.
+
+```{r}
+# ================================
+# STEP 6: Bar chart of service point activity
+# ================================
+
+ggplot(service_point_summary,
+aes(x = reorder(as.factor(location_id), total_activity),
+y = total_activity)) +
+geom_col() +
+coord_flip() +
+labs(
+title = "Total Parcel Activity per Service Point",
+x = "Service Point ID",
+y = "Total Annual Activity"
+) +
+theme_minimal()
+```
+Distribution of Parcel Activity
+
+The distribution of parcel activity across service points is highly uneven. A small number of locations accounts for a disproportionately large share of total parcel volume, while many other service points operate at relatively low activity levels.
+
+In particular, service point 4440 handles significantly more parcels than any other location in the network, followed by a limited number of additional high-volume service points. After these leading locations, parcel activity decreases rapidly, resulting in a clear long-tail distribution.
+
+This pattern suggests that the current network may suffer from operational imbalance. High-volume service points could potentially experience increased pressure on storage capacity and operational efficiency, while low-volume locations may represent underutilized infrastructure.
+
+The results indicate that future network optimization efforts may benefit from re-evaluating the allocation of service point capacity and the geographical distribution of parcel demand.
+
+```{r}
+# ================================
+# STEP 7: Pickups vs Deliveries
+# ================================
+
+ggplot(service_point_summary,
+aes(x = total_deliveries,
+y = total_pickups)) +
+geom_point(size = 3) +
+labs(
+title = "Pickups vs Deliveries per Service Point",
+x = "Total Deliveries",
+y = "Total Pickups"
+) +
+theme_minimal()
+```
+Pickup and Delivery Relationship
+
+The scatter plot comparing total pickups and total deliveries per service point reveals a strong positive relationship between both activities. In general, service points with high delivery volumes also tend to process large numbers of pickups.
+
+However, the results also show that pickups consistently exceed deliveries for most service points. This confirms the earlier finding that customer self-collection represents the dominant activity within the current network structure.
+
+Several service points appear as clear outliers, processing substantially larger parcel volumes than the rest of the network. These high-volume locations may represent strategically important hubs but could also face increased operational pressure and higher capacity requirements.
+
+At the same time, a number of service points exhibit relatively different pickup-to-delivery balances, suggesting that customer behavior may vary across different geographical areas of Maastricht.
+
+```{r}
+# ================================
+# STEP 8: Top and Bottom 5
+# ================================
+
+top_5_service_points <- service_point_summary %>%
+slice_max(total_activity, n = 5)
+
+bottom_5_service_points <- service_point_summary %>%
+slice_min(total_activity, n = 5)
+
+top_5_service_points
+
+bottom_5_service_points
+```
+Top and Bottom Performing Service Points
+
+The comparison between the most and least active service points highlights the strong imbalance within the current parcel network.
+
+The top five service points process substantially larger parcel volumes than the rest of the network. In particular, service point 4440 handles more than 166,000 parcels annually, making it by far the busiest location in Maastricht. Together, the top service points account for a significant share of total parcel activity, indicating a strong concentration of demand.
+
+Most high-volume service points are heavily pickup-oriented, suggesting that customer self-collection plays a major role in the efficiency of these locations. However, some service points display markedly different operational patterns. For example, service point 5820 has a delivery ratio exceeding 66%, making it significantly more delivery-oriented than most other locations in the network.
+
+At the opposite end of the ranking, several service points operate at extremely low activity levels. Service point 7422 processes only around 1,000 parcels annually, indicating very limited utilization compared to the leading locations. Such service points may represent inefficient infrastructure or may primarily serve low-density areas.
+
+Overall, the results suggest that the current network structure is unevenly utilized and may benefit from future optimization efforts regarding service point placement and capacity allocation
+
+```{r}
+# ================================
+# STEP 9: Identify overloaded and underused SPs
+# ================================
+
+high_threshold <- quantile(service_point_summary$total_activity, 0.80)
+
+low_threshold <- quantile(service_point_summary$total_activity, 0.20)
+
+service_point_summary <- service_point_summary %>%
+mutate(
+performance_category = case_when(
+total_activity >= high_threshold ~ "Potentially Overloaded",
+total_activity <= low_threshold ~ "Underused",
+TRUE ~ "Moderate Activity"
+)
+)
+
+service_point_summary
+
+table(service_point_summary$performance_category)
+```
+Identification of Overloaded and Underused Service Points
+
+To further evaluate the balance of the current parcel network, service points were classified according to their total annual parcel activity. Locations in the top 20% of parcel volume were labeled as “Potentially Overloaded,” while locations in the bottom 20% were classified as “Underused.”
+
+The results show that 7 service points fall into the potentially overloaded category, whereas another 7 service points appear to be underutilized. The remaining 21 locations operate at moderate activity levels.
+
+The overloaded service points process substantially larger parcel volumes than the rest of the network and may therefore experience higher operational pressure, increased storage requirements, and a greater risk of congestion or bounce-related inefficiencies.
+
+In contrast, underused service points handle relatively small parcel volumes compared to the network average. These locations may represent inefficient infrastructure allocation or may primarily serve low-density residential areas.
+
+Overall, the findings suggest that the current service point network is unevenly utilized and may benefit from future optimization regarding service point placement, capacity allocation, and potential integration of Automated Parcel Lockers (APLs).
+
+```{r}
+# ================================
+# STEP 10: Geographic SP performance map
+# ================================
+
+service_point_map <- service_points %>%
+left_join(service_point_summary,
+by = "location_id")
+
+ggplot(service_point_map,
+aes(x = x,
+y = y,
+color = performance_category,
+size = total_activity)) +
+geom_point(alpha = 0.8) +
+labs(
+title = "Geographic Distribution of Service Point Performance",
+x = "X Coordinate",
+y = "Y Coordinate",
+color = "Performance Category",
+size = "Total Activity"
+) +
+theme_minimal()
+```
+Spatial Distribution of Service Point Activity
+
+The geographic visualization of service point performance reveals that parcel activity is not evenly distributed across Maastricht.
+
+Several high-activity service points are spatially concentrated and appear to function as major operational hubs within the network. These locations process substantially larger parcel volumes than surrounding service points and may therefore experience higher operational pressure and storage utilization.
+
+In contrast, underused service points are more frequently located in peripheral or lower-activity areas. This suggests that certain parts of the current network may generate insufficient parcel demand relative to the infrastructure currently allocated to them.
+
+The visualization also indicates that geographically nearby service points can display significantly different activity levels. This may be explained by demographic differences, accessibility, customer behavior, or distance-related pickup preferences.
+
+Overall, the spatial analysis suggests that the current service point network may not perfectly align with the geographical distribution of parcel demand, highlighting opportunities for future optimization and potential APL integration in high-demand areas.
+
+```{r}
+# ================================
+# STEP 11: Share of total activity
+# ================================
+
+total_network_activity <- sum(service_point_summary$total_activity)
+
+service_point_summary <- service_point_summary %>%
+mutate(
+activity_share = total_activity / total_network_activity,
+activity_share_percent = activity_share * 100
+)
+
+service_point_summary
+```
+The share of total activity analysis shows that parcel demand is highly concentrated among a limited number of service points. In particular, service point 4440 alone accounts for more than 12% of the total annual parcel activity in Maastricht, making it a strategically important location within the network.
+
+More generally, the highest-performing service points contribute disproportionately to total parcel volume, while many smaller locations represent only a very small share of overall activity. These results further support the idea that operational pressure and capacity requirements are concentrated in a relatively small number of service points.
+
+```{r}
+# ================================
+# STEP 12: Concentration analysis
+# ================================
+
+service_point_summary <- service_point_summary %>%
+arrange(desc(total_activity)) %>%
+mutate(
+cumulative_activity = cumsum(activity_share_percent)
+)
+
+service_point_summary %>%
+select(
+location_id,
+total_activity,
+activity_share_percent,
+cumulative_activity
+)
+```
+The cumulative concentration analysis reveals a strong imbalance in parcel activity across the Maastricht service point network. The top five service points alone account for approximately 43% of total parcel activity, while the top ten locations process nearly two-thirds of the overall network volume.
+
+This indicates that parcel demand is heavily concentrated among a relatively small number of strategically important service points. As a result, operational pressure, storage demand, and potential congestion risks are likely concentrated within these high-volume locations.
+
+At the same time, many low-volume service points contribute only marginally to the overall network. Some locations account for less than 1% of total parcel activity, suggesting that parts of the current network may be underutilized or inefficiently allocated.
+
+```{r}
+# ================================
+# STEP 13: Pareto concentration chart
+# ================================
+
+ggplot(service_point_summary,
+aes(x = reorder(as.factor(location_id), -total_activity))) +
+geom_col(aes(y = activity_share_percent),
+fill = "steelblue") +
+geom_line(aes(y = cumulative_activity, group = 1),
+color = "red",
+size = 1) +
+geom_point(aes(y = cumulative_activity),
+color = "red",
+size = 2) +
+labs(
+title = "Concentration of Parcel Activity Across Service Points",
+x = "Service Point ID",
+y = "Activity Share / Cumulative Share (%)"
+) +
+theme_minimal() +
+theme(
+axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)
+)
+```
+The Pareto-style concentration analysis clearly demonstrates that parcel activity within the Maastricht network is highly unevenly distributed. The cumulative activity share increases rapidly for the first service points, indicating that a relatively small number of locations handles a disproportionately large share of total parcel demand.
+
+In contrast, the remaining service points contribute progressively smaller shares of total activity, forming a long-tail distribution. This suggests that the network relies heavily on a limited number of strategically important operational hubs, while several low-volume locations have only marginal impact on overall parcel operations.
+
+The results reinforce previous findings regarding network imbalance and indicate that future optimization efforts should primarily focus on the highest-volume service points, where capacity pressure and operational risks are likely to be most significant.

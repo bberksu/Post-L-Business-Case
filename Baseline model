@@ -1,0 +1,1038 @@
+"""
+Post&L Maastricht — Baseline Model & Shared Optimization Scaffold
+=================================================================
+Author  : Hannes
+Project : elab II Business Case #2
+
+This module is the shared foundation for ALL optimization methods in the group:
+  Niklas    — Greedy heuristic
+  Nicola    — Local search / swap heuristic
+  Tristan   — Simulated annealing
+  Elizaveta — Genetic algorithm
+  Beliz     — Mixed-integer (MILP) facility location
+
+PUBLIC API (what other team members need)
+-----------------------------------------
+  # Step 1 — build once and cache (takes ~30–60 s for Dijkstra)
+  net = build_network("data_Maastricht_2025.xlsx")
+  net.save_cache("postl_cache.pkl")
+
+  # Step 2 — fast reload every subsequent run (< 1 s)
+  net = PostLNetwork.load_cache("postl_cache.pkl")
+
+  # Step 3 — evaluate any candidate solution
+  result = evaluate(net, [0, 1, 4, 7, ...])          # list of SP indices (0–34)
+  result = evaluate_by_id(net, [4440, 1739, 753, ...]) # or by Location ID
+
+  # Step 4 — compare against baseline
+  ref = baseline_all_open(net)                        # 35-SP status quo
+  print(f"Your saving: €{ref.total_cost - result.total_cost:,.0f}")
+
+WEIGHTED OBJECTIVE
+------------------
+  By default the objective is pure cost minimisation.
+  Pass lambda_dist > 0 to add a coverage penalty:
+
+      objective = total_cost
+                + lambda_dist × sum_over_squares(max(0, dist_km − threshold) × sq_demand)
+
+  This penalises squares whose nearest open SP exceeds `max_dist_threshold_km`.
+  The penalty is demand-weighted so densely populated squares matter more.
+
+PARETO ANALYSIS
+---------------
+  Use pareto_frontier(results) to extract non-dominated solutions from any
+  collection of EvaluationResults.
+
+COST MODEL (confirmed with client)
+-----------------------------------
+  Fixed cost  : €50,000 per open SP per year
+  Delivery    : €1.50 per km  (distance from CBS square centroid to SP)
+  Storage     : €0.10 per package per day × 2 days assumed dwell time
+  Pickup rate : logistic decay  p(d) = 1 / (1 + exp(0.562 × (d − 2.04)))
+                fitted in Milestone 1 (d in km)
+"""
+
+import os
+import pickle
+import warnings
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+
+import networkx as nx
+import numpy as np
+import pandas as pd
+
+warnings.filterwarnings("ignore")
+
+# ── Cost parameters ────────────────────────────────────────────────────────────
+FIXED_COST_EUR       = 50_000  # € per SP per year
+DELIVERY_EUR_PER_KM  = 1.50    # € per km
+STORAGE_EUR_PKG_DAY  = 0.10    # € per package per day in storage
+AVG_DWELL_DAYS       = 2       # assumed average dwell time (days)
+
+# ── Pickup-rate logistic model (fitted in Milestone 1) ─────────────────────────
+LOGISTIC_K  = 0.562  # decay steepness
+LOGISTIC_D0 = 2.04   # 50 % crossover distance (km)
+
+
+def pickup_rate(d_km: np.ndarray) -> np.ndarray:
+    """Logistic pickup probability as a function of road distance to SP (km).
+
+    Fitted in Milestone 1:  p(d) = 1 / (1 + exp(0.562 × (d − 2.04)))
+    At d=0 km  →  p ≈ 0.94  (very likely to pick up if SP is on your doorstep)
+    At d=2.04 km →  p = 0.50  (crossover point)
+    At d=5 km  →  p ≈ 0.10  (most customers prefer home delivery)
+    """
+    return 1.0 / (1.0 + np.exp(LOGISTIC_K * (d_km - LOGISTIC_D0)))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DATA CONTAINER
+# ══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class PostLNetwork:
+    """
+    Precomputed network representation of the Post&L Maastricht problem.
+
+    Build once with build_network(), save with save_cache(), and reload with
+    PostLNetwork.load_cache() — all subsequent evaluate() calls are pure numpy
+    with no graph operations.
+
+    Attributes
+    ----------
+    sp_ids : list[int]
+        Location IDs of all 35 candidate service points.
+        The index of a Location ID in this list is its *SP index* (0–34).
+        dist_matrix column j corresponds to sp_ids[j].
+    sp_df : DataFrame
+        SP metadata: Location ID, X, Y, total_parcels (observed), avg_dist_km.
+    sq_demand : ndarray, shape (n_squares,)
+        Estimated annual parcel demand per CBS square.
+        Derived by distributing each SP's observed annual volume to its
+        Voronoi squares, weighted by household count.
+        sum(sq_demand) ≈ total observed annual parcels.
+    dist_matrix : ndarray, shape (n_squares, 35), dtype float64
+        Road distances in **metres** from each CBS square's nearest road node
+        to each SP's nearest road node, via Dijkstra shortest paths.
+        dist_matrix[i, j] = distance from square i to SP j.
+    annual_total : float
+        Total observed annual parcels across all 35 SPs (for reference).
+    """
+    sp_ids:       List[int]
+    sp_df:        pd.DataFrame
+    sq_demand:    np.ndarray
+    dist_matrix:  np.ndarray   # metres
+    annual_total: float
+
+    # ── Serialisation ─────────────────────────────────────────────────────────
+    def save_cache(self, path: str = "postl_cache.pkl") -> None:
+        """Pickle the precomputed network to skip Dijkstra on next run."""
+        with open(path, "wb") as f:
+            pickle.dump(self, f)
+        print(f"[cache] Saved → {path}")
+
+    @classmethod
+    def load_cache(cls, path: str = "postl_cache.pkl") -> "PostLNetwork":
+        """Load a previously cached network (fast, no Dijkstra needed)."""
+        with open(path, "rb") as f:
+            obj = pickle.load(f)
+        print(f"[cache] Loaded ← {path}  "
+              f"({obj.n_sps} SPs, {obj.n_squares} squares)")
+        return obj
+
+    # ── Convenience properties ────────────────────────────────────────────────
+    @property
+    def n_sps(self) -> int:
+        """Total number of candidate service points (35)."""
+        return len(self.sp_ids)
+
+    @property
+    def n_squares(self) -> int:
+        """Number of CBS squares with population data."""
+        return self.dist_matrix.shape[0]
+
+    def idx_of(self, sp_id: int) -> int:
+        """Return the column index (0–34) of a given SP Location ID."""
+        return self.sp_ids.index(sp_id)
+
+    def ids_to_indices(self, sp_id_list: List[int]) -> List[int]:
+        """Convert a list of SP Location IDs to column indices."""
+        return [self.idx_of(sid) for sid in sp_id_list]
+
+    def indices_to_ids(self, indices: List[int]) -> List[int]:
+        """Convert a list of column indices to SP Location IDs."""
+        return [self.sp_ids[i] for i in indices]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EVALUATION RESULT
+# ══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class EvaluationResult:
+    """
+    Full cost/quality breakdown for a given set of open service points.
+
+    Quick reference for optimizers
+    ───────────────────────────────
+    result.objective   — the scalar to minimise (cost + optional distance penalty)
+    result.total_cost  — pure cost in €/year (no penalty)
+    result.max_dist_km — worst-case customer distance (coverage proxy)
+    result.n_open      — number of open SPs
+
+    Comparing two solutions
+    ───────────────────────
+    Better solution has lower objective.  If lambda_dist=0, objective == total_cost.
+    """
+    # Scalar objectives
+    objective:        float   # total_cost + lambda_dist × distance_penalty
+    total_cost:       float   # € / year
+    fixed_cost:       float   # n_open × €50,000
+    delivery_cost:    float   # home deliveries × distance × €1.50/km
+    storage_cost:     float   # pickups × 2 days × €0.10/pkg/day
+    # Coverage
+    max_dist_km:      float   # max road distance from any CBS square to its SP
+    avg_dist_km:      float   # demand-weighted average distance to assigned SP
+    # Volume
+    total_pickups:    float
+    total_deliveries: float
+    pickup_rate_net:  float   # total_pickups / total_parcels
+    # Configuration
+    open_sp_indices:  List[int]
+    open_sp_ids:      List[int]
+    n_open:           int
+    # SP-level breakdown (suppress in repr for readability)
+    sp_detail:        pd.DataFrame = field(repr=False)
+
+    def __str__(self) -> str:
+        lines = [
+            "─── EvaluationResult ───────────────────────────────────",
+            f"  Open SPs   : {self.n_open} of 35",
+            f"  Objective  : €{self.objective:>12,.0f}",
+            f"  Total cost : €{self.total_cost:>12,.0f}",
+            f"    Fixed    : €{self.fixed_cost:>12,.0f}  ({self.fixed_cost/self.total_cost:.1%})",
+            f"    Delivery : €{self.delivery_cost:>12,.0f}  ({self.delivery_cost/self.total_cost:.1%})",
+            f"    Storage  : €{self.storage_cost:>12,.0f}  ({self.storage_cost/self.total_cost:.1%})",
+            f"  Max dist   : {self.max_dist_km:>8.2f} km",
+            f"  Avg dist   : {self.avg_dist_km:>8.2f} km  (demand-weighted)",
+            f"  Pickup rate: {self.pickup_rate_net:>8.1%}",
+            "────────────────────────────────────────────────────────",
+        ]
+        return "\n".join(lines)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CORE EVALUATE FUNCTION  ← THE SHARED OBJECTIVE FUNCTION
+# ══════════════════════════════════════════════════════════════════════════════
+
+def evaluate(
+    net: PostLNetwork,
+    open_sp_indices: List[int],
+    lambda_dist: float = 0.0,
+    max_dist_threshold_km: Optional[float] = None,
+) -> EvaluationResult:
+    """
+    Evaluate the total cost and service quality of a SP configuration.
+
+    This is the **shared objective function** used by all optimisation methods.
+    It is fully vectorised (numpy only — no graph calls) and runs in < 1 ms
+    for any subset of the 35 SPs.
+
+    Parameters
+    ----------
+    net : PostLNetwork
+        Precomputed network.  Load once, pass everywhere.
+    open_sp_indices : list[int]
+        Column indices (0–34) of the SPs to open.
+        Use net.ids_to_indices([4440, 1739, ...]) to convert Location IDs.
+    lambda_dist : float, optional (default 0)
+        Weight for the coverage penalty in the weighted objective:
+            objective = total_cost
+                      + lambda_dist
+                        × Σ_squares  max(0, dist_km − threshold) × demand_sq
+        Set lambda_dist=0 for pure cost optimisation (default).
+        Typical values: 1e3 – 1e5 depending on desired cost/coverage balance.
+    max_dist_threshold_km : float, optional
+        Distance threshold above which a penalty is applied (km).
+        Only used when lambda_dist > 0.
+        Suggested value: 3.0 km (≈ acceptable walk to a service point).
+
+    Returns
+    -------
+    EvaluationResult
+        .objective        — scalar to minimise
+        .total_cost       — annual cost (€)
+        .max_dist_km      — worst-case customer distance (km)
+        .sp_detail        — per-SP breakdown DataFrame
+
+    Examples
+    --------
+    Pure cost minimisation:
+        result = evaluate(net, [0, 3, 7, 12, 20])
+
+    Cost + coverage (penalise squares > 3 km from nearest SP):
+        result = evaluate(net, [0, 3, 7, 12, 20],
+                          lambda_dist=1e4, max_dist_threshold_km=3.0)
+
+    Compare against all-35-open baseline:
+        ref    = baseline_all_open(net)
+        result = evaluate(net, my_indices)
+        saving = ref.total_cost - result.total_cost
+    """
+    if len(open_sp_indices) == 0:
+        raise ValueError("open_sp_indices must contain at least one SP.")
+
+    indices = np.array(open_sp_indices, dtype=int)
+    n_sq    = net.n_squares
+    dm      = net.dist_matrix   # (n_squares, 35), metres
+
+    # ── 1. Assign each CBS square to its nearest open SP ──────────────────────
+    sub         = dm[:, indices]                              # (n_sq, n_open) m
+    local_col   = sub.argmin(axis=1)                          # (n_sq,) → index into `indices`
+    dist_m      = sub[np.arange(n_sq), local_col]            # (n_sq,) metres
+    dist_km     = dist_m / 1_000.0                            # (n_sq,) km
+
+    # ── 2. Pickup rate per CBS square ─────────────────────────────────────────
+    p_up        = pickup_rate(dist_km)                        # (n_sq,) ∈ [0, 1]
+
+    # ── 3. Annual volume per CBS square ───────────────────────────────────────
+    demand      = net.sq_demand                               # (n_sq,) parcels/yr
+    pickups     = demand * p_up                               # (n_sq,)
+    deliveries  = demand * (1.0 - p_up)                       # (n_sq,)
+
+    # ── 4. Aggregate costs per open SP ───────────────────────────────────────
+    sp_rows = []
+    for local_j, global_j in enumerate(indices):
+        mask = local_col == local_j
+
+        if not mask.any():
+            # Open SP with no CBS squares in catchment — still pays fixed cost
+            sp_rows.append({
+                "sp_index":          int(global_j),
+                "sp_id":             net.sp_ids[global_j],
+                "n_squares":         0,
+                "annual_pickups":    0.0,
+                "annual_deliveries": 0.0,
+                "avg_dist_km":       0.0,
+                "delivery_cost":     0.0,
+                "storage_cost":      0.0,
+                "fixed_cost":        float(FIXED_COST_EUR),
+                "total_cost":        float(FIXED_COST_EUR),
+                "cost_per_parcel":   float("inf"),
+            })
+            continue
+
+        sq_dem   = demand[mask]
+        sq_dist  = dist_km[mask]
+        sq_pick  = pickups[mask]
+        sq_del   = deliveries[mask]
+
+        ann_pick = float(sq_pick.sum())
+        ann_del  = float(sq_del.sum())
+
+        # Delivery cost: parcel travels from SP to customer (distance proxy)
+        del_cost  = float((sq_del * sq_dist * DELIVERY_EUR_PER_KM).sum())
+        stor_cost = float(ann_pick * AVG_DWELL_DAYS * STORAGE_EUR_PKG_DAY)
+        fix_cost  = float(FIXED_COST_EUR)
+        tot_cost  = del_cost + stor_cost + fix_cost
+
+        total_vol_sp = ann_pick + ann_del
+        avg_d = float(np.average(sq_dist, weights=sq_dem)) if sq_dem.sum() > 0 else 0.0
+
+        sp_rows.append({
+            "sp_index":          int(global_j),
+            "sp_id":             net.sp_ids[global_j],
+            "n_squares":         int(mask.sum()),
+            "annual_pickups":    ann_pick,
+            "annual_deliveries": ann_del,
+            "avg_dist_km":       avg_d,
+            "delivery_cost":     del_cost,
+            "storage_cost":      stor_cost,
+            "fixed_cost":        fix_cost,
+            "total_cost":        tot_cost,
+            "cost_per_parcel":   tot_cost / max(total_vol_sp, 1.0),
+        })
+
+    sp_detail = pd.DataFrame(sp_rows)
+
+    # ── 5. Network-level aggregates ───────────────────────────────────────────
+    total_del   = float(deliveries.sum())
+    total_pick  = float(pickups.sum())
+    total_vol   = total_del + total_pick
+
+    fixed_cost    = float(len(indices) * FIXED_COST_EUR)
+    delivery_cost = float((deliveries * dist_km * DELIVERY_EUR_PER_KM).sum())
+    storage_cost  = float(total_pick * AVG_DWELL_DAYS * STORAGE_EUR_PKG_DAY)
+    total_cost    = fixed_cost + delivery_cost + storage_cost
+
+    max_dist_km     = float(dist_km.max())
+    avg_dist_km     = float(np.average(dist_km, weights=demand)) if demand.sum() > 0 else 0.0
+    pickup_rate_net = total_pick / total_vol if total_vol > 0 else 0.0
+
+    # ── 6. Weighted objective (cost + optional coverage penalty) ──────────────
+    if lambda_dist > 0.0:
+        threshold   = max_dist_threshold_km if max_dist_threshold_km is not None else 0.0
+        excess      = np.maximum(0.0, dist_km - threshold)   # (n_sq,) km over threshold
+        penalty_val = float(np.dot(excess, demand))           # demand-weighted excess km
+        penalty     = lambda_dist * penalty_val
+    else:
+        penalty = 0.0
+
+    objective = total_cost + penalty
+
+    return EvaluationResult(
+        objective        = objective,
+        total_cost       = total_cost,
+        fixed_cost       = fixed_cost,
+        delivery_cost    = delivery_cost,
+        storage_cost     = storage_cost,
+        max_dist_km      = max_dist_km,
+        avg_dist_km      = avg_dist_km,
+        total_pickups    = total_pick,
+        total_deliveries = total_del,
+        pickup_rate_net  = pickup_rate_net,
+        open_sp_indices  = list(map(int, indices)),
+        open_sp_ids      = [net.sp_ids[i] for i in indices],
+        n_open           = len(indices),
+        sp_detail        = sp_detail,
+    )
+
+
+def evaluate_by_id(
+    net: PostLNetwork,
+    sp_id_list: List[int],
+    lambda_dist: float = 0.0,
+    max_dist_threshold_km: Optional[float] = None,
+) -> EvaluationResult:
+    """Convenience wrapper: evaluate using SP Location IDs instead of indices.
+
+    Example
+    -------
+        result = evaluate_by_id(net, [4440, 1739, 753, 4387, 4431])
+    """
+    return evaluate(net, net.ids_to_indices(sp_id_list),
+                    lambda_dist, max_dist_threshold_km)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# APL CANDIDATE SUPPORT  (new in v2)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def add_apl_candidates(
+    net: PostLNetwork,
+    data_path: str,
+    apl_xy: List[Tuple[float, float]],
+    apl_ids: Optional[List] = None,
+) -> PostLNetwork:
+    """
+    Extend the network with Automated Parcel Locker (APL) candidate locations.
+
+    APLs are potential new pickup points that can be placed anywhere — typically
+    at CBS square centroids in underserved or high-distance areas.  Once added,
+    they become additional columns in the distance matrix and are treated exactly
+    like SPs inside evaluate().
+
+    This function re-uses the cached road graph from the original build by
+    re-reading the Excel file and re-building the graph.  It only runs Dijkstra
+    for the NEW APL nodes, so it is much faster than a full rebuild.
+
+    Parameters
+    ----------
+    net : PostLNetwork
+        The existing network (output of build_network or load_cache).
+    data_path : str
+        Path to data_Maastricht_2025.xlsx (needed to re-build the road graph).
+    apl_xy : list of (x, y) tuples
+        Coordinates of candidate APL locations (same coordinate system as the
+        road network nodes and CBS squares).
+    apl_ids : list, optional
+        IDs for the APLs.  Defaults to ["APL_0", "APL_1", ...].
+
+    Returns
+    -------
+    PostLNetwork
+        A new PostLNetwork with APLs appended.  Original SP indices are
+        unchanged (0–34).  APL indices start at 35.
+
+    Example
+    -------
+    High-distance CBS squares identified in the EDA as underserved
+    (all assigned to SP 5820, distances > 4 km):
+
+        apl_positions = [
+            (98158, 75000),   # near E1800N3220  (1,125 residents, 4.2 km)
+            (103000, 72000),  # near E1805N3215  (1,115 residents, 4.6 km)
+        ]
+        net_with_apls = add_apl_candidates(net, "data_Maastricht_2025.xlsx",
+                                            apl_positions)
+        result = evaluate(net_with_apls, list(range(35)) + [35, 36])
+    """
+    if apl_ids is None:
+        apl_ids = [f"APL_{i}" for i in range(len(apl_xy))]
+    if len(apl_ids) != len(apl_xy):
+        raise ValueError("apl_ids and apl_xy must have the same length.")
+
+    print(f"[APL] Adding {len(apl_xy)} candidate APL location(s) …")
+
+    # ── Rebuild road graph (directed, ONE_WAY-aware) ──────────────────────────
+    xl    = pd.ExcelFile(data_path)
+    nodes = pd.read_excel(xl, "Nodes")
+    edges = pd.read_excel(xl, "Edges")
+
+    G = nx.DiGraph()
+    for _, r in nodes.iterrows():
+        G.add_node(int(r["NODE ID"]), x=r["X"], y=r["Y"])
+    for _, r in edges.iterrows():
+        v1, v2, dist = int(r["V1"]), int(r["V2"]), float(r["DIST"])
+        G.add_edge(v1, v2, weight=dist)
+        if not bool(r["ONE_WAY"]):
+            G.add_edge(v2, v1, weight=dist)
+    G = G.subgraph(max(nx.weakly_connected_components(G), key=len)).copy()
+
+    node_arr = np.array([[G.nodes[n]["x"], G.nodes[n]["y"]] for n in G.nodes()])
+    node_ids = np.array(list(G.nodes()))
+
+    def nearest_node(x: float, y: float) -> int:
+        diffs = node_arr - np.array([x, y])
+        return int(node_ids[np.argmin((diffs ** 2).sum(axis=1))])
+
+    # ── Retrieve the CBS square nodes used during the original build ───────────
+    cbs   = pd.read_excel(xl, "CBS Squares")
+    cbs_pop = cbs[cbs["Population"].notna()].copy().reset_index(drop=True)
+    cbs_pop["node"] = [nearest_node(r["X"], r["Y"]) for _, r in cbs_pop.iterrows()]
+    sq_nodes = cbs_pop["node"].values
+    n_sq = len(sq_nodes)
+
+    # ── Run Dijkstra from each APL node ───────────────────────────────────────
+    n_apl = len(apl_xy)
+    apl_dist_matrix = np.full((n_sq, n_apl), np.inf)
+
+    for j, (ax, ay) in enumerate(apl_xy):
+        apl_node = nearest_node(ax, ay)
+        dmap = nx.single_source_dijkstra_path_length(G, apl_node, weight="weight")
+        for i, nd in enumerate(sq_nodes):
+            apl_dist_matrix[i, j] = dmap.get(int(nd), np.inf)
+        print(f"     APL {j+1}/{n_apl}  ({apl_ids[j]})  snapped to node {apl_node}")
+
+    if np.isinf(apl_dist_matrix).any():
+        max_finite = apl_dist_matrix[np.isfinite(apl_dist_matrix)].max()
+        apl_dist_matrix = np.where(
+            np.isinf(apl_dist_matrix), max_finite * 10, apl_dist_matrix
+        )
+
+    # ── Build APL metadata rows ───────────────────────────────────────────────
+    apl_rows = []
+    for j, (apl_id, (ax, ay)) in enumerate(zip(apl_ids, apl_xy)):
+        col = net.n_sps + j
+        apl_rows.append({
+            "Location ID": apl_id,
+            "X": ax,
+            "Y": ay,
+            "type": "APL",
+            "total_parcels": 0.0,      # no observed history
+            "avg_dist_km": float(
+                np.average(apl_dist_matrix[:, j] / 1_000.0,
+                           weights=net.sq_demand)
+            ),
+        })
+
+    apl_df = pd.DataFrame(apl_rows)
+
+    # ── Merge into existing network ───────────────────────────────────────────
+    # Mark original SPs as type SP if column absent
+    existing_df = net.sp_df.copy()
+    if "type" not in existing_df.columns:
+        existing_df["type"] = "SP"
+
+    new_sp_df   = pd.concat([existing_df, apl_df], ignore_index=True)
+    new_sp_ids  = net.sp_ids + list(apl_ids)
+    new_dist_matrix = np.hstack([net.dist_matrix, apl_dist_matrix])
+
+    print(f"[APL] Done.  Network now has {len(new_sp_ids)} candidate locations "
+          f"({net.n_sps} SPs + {n_apl} APLs).")
+
+    return PostLNetwork(
+        sp_ids       = new_sp_ids,
+        sp_df        = new_sp_df,
+        sq_demand    = net.sq_demand,
+        dist_matrix  = new_dist_matrix,
+        annual_total = net.annual_total,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BASELINE SOLUTION BUILDERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def baseline_all_open(net: PostLNetwork, **eval_kwargs) -> EvaluationResult:
+    """
+    Baseline A — Status quo: all 35 SPs open.
+
+    This is the **reference benchmark**.  Every other solution should be
+    compared against this.  The gap (ref.total_cost − result.total_cost)
+    is the annual saving your method achieves.
+    """
+    return evaluate(net, list(range(net.n_sps)), **eval_kwargs)
+
+
+def baseline_top_k(net: PostLNetwork, k: int, **eval_kwargs) -> EvaluationResult:
+    """
+    Baseline B — Open only the top-K SPs by observed annual parcel volume.
+
+    A simple rule-based greedy reduction: keep the busiest SPs, drop the rest.
+    This is naive (ignores geography) but gives a fast cost-curve upper bound.
+
+    Parameters
+    ----------
+    k : int
+        Number of SPs to open (1 ≤ k ≤ 35).
+    """
+    if not (1 <= k <= net.n_sps):
+        raise ValueError(f"k must be in [1, {net.n_sps}], got {k}.")
+    top_k_ids = (
+        net.sp_df
+        .nlargest(k, "total_parcels")["Location ID"]
+        .tolist()
+    )
+    return evaluate(net, net.ids_to_indices(top_k_ids), **eval_kwargs)
+
+
+def sweep_k(
+    net: PostLNetwork,
+    lambda_dist: float = 0.0,
+    max_dist_threshold_km: Optional[float] = None,
+    verbose: bool = True,
+) -> pd.DataFrame:
+    """
+    Evaluate baseline_top_k for every k from 1 to 35.
+
+    Returns a DataFrame with cost components and coverage metrics for each k.
+    Useful for plotting the cost-vs-coverage trade-off curve and identifying
+    the 'elbow' (optimal k for pure cost minimisation).
+    """
+    rows = []
+    for k in range(1, net.n_sps + 1):
+        r = baseline_top_k(net, k,
+                           lambda_dist=lambda_dist,
+                           max_dist_threshold_km=max_dist_threshold_km)
+        rows.append({
+            "k":             k,
+            "objective":     r.objective,
+            "total_cost":    r.total_cost,
+            "fixed_cost":    r.fixed_cost,
+            "delivery_cost": r.delivery_cost,
+            "storage_cost":  r.storage_cost,
+            "max_dist_km":   r.max_dist_km,
+            "avg_dist_km":   r.avg_dist_km,
+            "pickup_rate":   r.pickup_rate_net,
+        })
+        if verbose:
+            tag = " ← STATUS QUO" if k == 35 else ""
+            print(f"  k={k:2d}  cost=€{r.total_cost:>9,.0f}  "
+                  f"max_dist={r.max_dist_km:5.2f} km  "
+                  f"pickup={r.pickup_rate_net:.1%}{tag}")
+
+    return pd.DataFrame(rows)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PARETO UTILITIES
+# ══════════════════════════════════════════════════════════════════════════════
+
+def pareto_frontier(
+    results: List[EvaluationResult],
+    obj1: str = "total_cost",
+    obj2: str = "max_dist_km",
+) -> List[EvaluationResult]:
+    """
+    Extract Pareto-optimal solutions from a list of EvaluationResults.
+
+    Both objectives are minimised.  Default: total_cost vs max_dist_km.
+
+    A solution is Pareto-optimal if no other solution is at least as good on
+    both objectives and strictly better on at least one.
+
+    Parameters
+    ----------
+    results : list[EvaluationResult]
+        Any collection of evaluated solutions (from sweep, SA, GA, etc.).
+    obj1 : str
+        First attribute to minimise (default: "total_cost").
+    obj2 : str
+        Second attribute to minimise (default: "max_dist_km").
+
+    Returns
+    -------
+    list[EvaluationResult]
+        Pareto-optimal subset, sorted by obj1 ascending.
+
+    Example
+    -------
+        all_results = [evaluate(net, sample()) for _ in range(1000)]
+        front = pareto_frontier(all_results)
+    """
+    vals = np.array([(getattr(r, obj1), getattr(r, obj2)) for r in results])
+    n = len(results)
+    dominated = np.zeros(n, dtype=bool)
+
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            # j dominates i if it is ≤ on both and < on at least one
+            if (vals[j, 0] <= vals[i, 0] and vals[j, 1] <= vals[i, 1] and
+                    (vals[j, 0] < vals[i, 0] or vals[j, 1] < vals[i, 1])):
+                dominated[i] = True
+                break
+
+    pareto = [r for r, d in zip(results, dominated) if not d]
+    pareto.sort(key=lambda r: getattr(r, obj1))
+    return pareto
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NETWORK BUILDER  (run once, then use cache)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def build_network(data_path: str) -> PostLNetwork:
+    """
+    Load data from Excel, build road network, precompute all distance matrices,
+    and estimate annual demand per CBS square.
+
+    ⚠ This function takes ~30–60 seconds (35 × Dijkstra on 8k-node graph).
+    After calling this once, save the result and use load_cache() instead:
+
+        net = build_network("data_Maastricht_2025.xlsx")
+        net.save_cache("postl_cache.pkl")
+
+        # All subsequent runs:
+        net = PostLNetwork.load_cache("postl_cache.pkl")
+
+    Parameters
+    ----------
+    data_path : str
+        Path to data_Maastricht_2025.xlsx.
+
+    Returns
+    -------
+    PostLNetwork
+    """
+    # ── 0. Load all sheets ────────────────────────────────────────────────────
+    print("=" * 60)
+    print("  POST&L MAASTRICHT — BUILDING NETWORK")
+    print("=" * 60)
+    print(f"\n[1/5] Loading data from {data_path} …")
+
+    xl    = pd.ExcelFile(data_path)
+    sp    = pd.read_excel(xl, "Service Point Locations")
+    da    = pd.read_excel(xl, "Daily Activity")
+    nodes = pd.read_excel(xl, "Nodes")
+    edges = pd.read_excel(xl, "Edges")
+    cbs   = pd.read_excel(xl, "CBS Squares")
+
+    # Keep only CBS squares with population data
+    cbs_pop = cbs[cbs["Population"].notna()].copy().reset_index(drop=True)
+    print(f"     {len(sp)} SPs · {len(da):,} activity records · "
+          f"{len(nodes):,} nodes · {len(edges):,} edges · {len(cbs_pop)} CBS squares")
+
+    # ── 1. Build road-network graph ───────────────────────────────────────────
+    print("\n[2/5] Building road network graph …")
+    # CHANGE v2: Use a directed graph (DiGraph) and respect the ONE_WAY flag.
+    # The original baseline used an undirected Graph, silently treating every
+    # road as bidirectional.  21 % of edges are one-way, which caused the
+    # max-distance figure to differ from other team members' analyses.
+    # Approach (matching Nicola's Python and Beliz's R):
+    #   - Every edge is added in the forward direction V1 → V2.
+    #   - Two-way roads (ONE_WAY == False) also get a reverse edge V2 → V1.
+    G = nx.DiGraph()
+    for _, r in nodes.iterrows():
+        G.add_node(int(r["NODE ID"]), x=r["X"], y=r["Y"])
+    for _, r in edges.iterrows():
+        v1, v2, dist = int(r["V1"]), int(r["V2"]), float(r["DIST"])
+        G.add_edge(v1, v2, weight=dist)
+        if not bool(r["ONE_WAY"]):          # two-way road → add reverse edge
+            G.add_edge(v2, v1, weight=dist)
+
+    # Take largest weakly-connected component (consistent with undirected baseline)
+    G = G.subgraph(
+        max(nx.weakly_connected_components(G), key=len)
+    ).copy()
+    print(f"     Largest WCC: {G.number_of_nodes():,} nodes, "
+          f"{G.number_of_edges():,} edges  "
+          f"({edges['ONE_WAY'].mean():.1%} of original edges are one-way)")
+
+    # ── 2. Map SPs and CBS squares to nearest road node ───────────────────────
+    print("\n[3/5] Snapping SPs and CBS squares to road nodes …")
+    node_arr = np.array([[G.nodes[n]["x"], G.nodes[n]["y"]] for n in G.nodes()])
+    node_ids = np.array(list(G.nodes()))
+
+    def nearest_node(x: float, y: float) -> int:
+        diffs = node_arr - np.array([x, y])
+        return int(node_ids[np.argmin((diffs ** 2).sum(axis=1))])
+
+    sp["node"]      = [nearest_node(r["X"], r["Y"]) for _, r in sp.iterrows()]
+    cbs_pop["node"] = [nearest_node(r["X"], r["Y"]) for _, r in cbs_pop.iterrows()]
+
+    # ── 3. Dijkstra from every SP → distance matrix ───────────────────────────
+    print("\n[4/5] Running Dijkstra from each SP (≈30–60 s) …")
+    sp_ids   = sp["Location ID"].tolist()
+    sq_nodes = cbs_pop["node"].values
+    n_sq     = len(cbs_pop)
+    n_sp     = len(sp_ids)
+
+    dist_matrix = np.full((n_sq, n_sp), np.inf)
+
+    for j, (_, row) in enumerate(sp.iterrows()):
+        dmap = nx.single_source_dijkstra_path_length(G, row["node"], weight="weight")
+        for i, nd in enumerate(sq_nodes):
+            dist_matrix[i, j] = dmap.get(int(nd), np.inf)
+        if (j + 1) % 5 == 0 or j == n_sp - 1:
+            print(f"     SP {j+1:2d}/{n_sp} complete")
+
+    # Resolve any inf values (disconnected squares) with large finite distance
+    if np.isinf(dist_matrix).any():
+        n_inf = np.isinf(dist_matrix).sum()
+        fallback = dist_matrix[np.isfinite(dist_matrix)].max() * 2.0
+        dist_matrix = np.where(np.isinf(dist_matrix), fallback, dist_matrix)
+        print(f"     ⚠ {n_inf} inf values replaced with {fallback/1000:.1f} km fallback")
+
+    # ── 4. Estimate demand per CBS square ─────────────────────────────────────
+    print("\n[5/5] Estimating square-level demand …")
+
+    # Annual volumes from observed activity data
+    annual = (
+        da.groupby("Location ID")
+        .agg(total_deliveries=("Deliveries", "sum"),
+             total_pickups   =("Pickups",    "sum"))
+        .reset_index()
+    )
+    annual["total_parcels"] = annual["total_deliveries"] + annual["total_pickups"]
+    annual_total = float(annual["total_parcels"].sum())
+
+    # CHANGE v2: Population-proportional demand distribution.
+    # Original: distributed each SP's observed volume to its Voronoi squares
+    #           proportionally by household count.
+    # Updated:  distribute total network demand proportionally to population
+    #           directly — consistent with the EDA finding that
+    #           "Population is the primary variable" (slide 11) and with
+    #           Nicola's demand model (demand_sq = population × demand_factor).
+    #
+    # demand_factor = total_annual_parcels / total_population
+    # demand_sq[i]  = population[i] × demand_factor
+    total_population = float(cbs_pop["Population"].sum())
+    demand_factor    = annual_total / total_population
+    sq_demand        = cbs_pop["Population"].values * demand_factor
+
+    print(f"     Population: {total_population:,.0f} residents  |  "
+          f"demand factor: {demand_factor:.4f} parcels/resident/year")
+    print(f"     Demand distributed: {sq_demand.sum():,.0f} parcels "
+          f"(observed: {annual_total:,.0f}  ·  diff: "
+          f"{abs(sq_demand.sum() - annual_total)/annual_total:.1%})")
+
+    # ── 5. Compute SP-level avg distances for reference ───────────────────────
+    sp_aug = sp.merge(annual, on="Location ID", how="left").fillna(0)
+    nearest_col = dist_matrix.argmin(axis=1)   # current Voronoi (all 35 open)
+    for j, sid in enumerate(sp_ids):
+        mask = nearest_col == j
+        if mask.any() and cbs_pop.loc[mask, "Population"].sum() > 0:
+            sp_aug.loc[sp_aug["Location ID"] == sid, "avg_dist_km"] = np.average(
+                dist_matrix[mask, j] / 1_000.0,
+                weights=cbs_pop.loc[mask, "Population"],
+            )
+        else:
+            sp_aug.loc[sp_aug["Location ID"] == sid, "avg_dist_km"] = np.nan
+
+    sp_aug = sp_aug.reset_index(drop=True)
+
+    print("\n✓ Network ready.\n")
+    return PostLNetwork(
+        sp_ids       = sp_ids,
+        sp_df        = sp_aug,
+        sq_demand    = sq_demand,
+        dist_matrix  = dist_matrix,
+        annual_total = annual_total,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CLI — run as:  python baseline_model.py [path/to/data.xlsx]
+# ══════════════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    import sys
+    import matplotlib.pyplot as plt
+    import matplotlib.ticker as mticker
+
+    ORANGE = "#F79220"
+    NAVY   = "#1C2D6B"
+    TEAL   = "#028090"
+    CORAL  = "#E8603C"
+    GRAY   = "#64748B"
+
+    # ── 0. Load or build network ──────────────────────────────────────────────
+    DATA_PATH  = sys.argv[1] if len(sys.argv) > 1 else r"C:\Users\Dirk\OneDrive\Desktop\data_Maastricht_2025.xlsx"
+    CACHE_PATH = r"C:\Users\Dirk\OneDrive\Desktop\postl_cache_v2.pkl"
+
+    def _build_net():
+        if not os.path.exists(DATA_PATH):
+            print(f"ERROR: {DATA_PATH!r} not found.")
+            print("Usage:  python baseline_model.py [path/to/data_Maastricht_2025.xlsx]")
+            sys.exit(1)
+        built = build_network(DATA_PATH)
+        built.save_cache(CACHE_PATH)
+        return built
+
+    if os.path.exists(CACHE_PATH):
+        try:
+            net = PostLNetwork.load_cache(CACHE_PATH)
+        except Exception as e:
+            print(f"[cache] Incompatible cache (pandas version mismatch?): {e}")
+            print("[cache] Rebuilding from source data...")
+            net = _build_net()
+    else:
+        net = _build_net()
+
+    # ── 1. Baseline A: all 35 SPs open (status quo) ───────────────────────────
+    print("\n" + "=" * 60)
+    print("  BASELINE A — Status quo: all 35 SPs open")
+    print("=" * 60)
+    ref = baseline_all_open(net)
+    print(ref)
+    print(f"\n  SP detail (sorted by total cost):\n")
+    print(
+        ref.sp_detail
+        .sort_values("total_cost", ascending=False)
+        [["sp_id", "n_squares", "annual_pickups", "annual_deliveries",
+          "avg_dist_km", "delivery_cost", "storage_cost", "total_cost", "cost_per_parcel"]]
+        .round({"avg_dist_km": 2, "cost_per_parcel": 2})
+        .to_string(index=False)
+    )
+
+    # ── 2. Baseline B: top-K by volume (quick sanity checks) ─────────────────
+    print("\n" + "=" * 60)
+    print("  BASELINE B — Top-K by volume (k ∈ {10, 15, 20, 25, 30, 35})")
+    print("=" * 60)
+    print(f"  {'k':>3}  {'Cost (€)':>12}  {'vs. status quo':>15}  "
+          f"{'Max dist (km)':>14}  {'Pickup %':>9}")
+    print("  " + "-" * 60)
+    for k in [10, 15, 20, 25, 30, 35]:
+        r   = baseline_top_k(net, k)
+        gap = r.total_cost - ref.total_cost
+        tag = " ← STATUS QUO" if k == 35 else ""
+        print(f"  {k:>3}  €{r.total_cost:>10,.0f}  "
+              f"{gap:>+13,.0f}  "
+              f"{r.max_dist_km:>14.2f}  "
+              f"{r.pickup_rate_net:>9.1%}{tag}")
+
+    # ── 3. Full k=1..35 sweep ─────────────────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("  FULL SWEEP: k = 1 … 35  (top-K by volume)")
+    print("=" * 60)
+    sweep_df = sweep_k(net, verbose=True)
+
+    # ── 4. Pareto frontier: cost vs max distance ──────────────────────────────
+    print("\n" + "=" * 60)
+    print("  PARETO FRONTIER: total cost vs. max customer distance")
+    print("=" * 60)
+    all_k_results = [baseline_top_k(net, k) for k in range(1, 36)]
+    pareto        = pareto_frontier(all_k_results, "total_cost", "max_dist_km")
+    print(f"  {len(pareto)} Pareto-optimal configurations (from top-K baseline):\n")
+    print(f"  {'k':>3}  {'Cost (€)':>12}  {'Max dist (km)':>14}  {'Pickup %':>9}")
+    print("  " + "-" * 45)
+    for r in pareto:
+        print(f"  {r.n_open:>3}  €{r.total_cost:>10,.0f}  {r.max_dist_km:>14.2f}  "
+              f"{r.pickup_rate_net:>9.1%}")
+
+    # ── 5. Cost-coverage trade-off plot ───────────────────────────────────────
+    fig, axes = plt.subplots(1, 3, figsize=(17, 5))
+    fig.suptitle("Post&L Maastricht — Baseline: Cost vs. Coverage Trade-off",
+                 fontsize=13, fontweight="bold", color=NAVY, y=1.02)
+
+    # 5a. Stacked cost components vs k
+    ax = axes[0]
+    ax.stackplot(
+        sweep_df["k"],
+        sweep_df["fixed_cost"]    / 1e6,
+        sweep_df["delivery_cost"] / 1e6,
+        sweep_df["storage_cost"]  / 1e6,
+        labels=["Fixed (€50k/SP)", "Delivery (€1.50/km)", "Storage (€0.10/pkg/day)"],
+        colors=[NAVY, CORAL, ORANGE], alpha=0.85,
+    )
+    ax.axvline(35, color="red", linestyle="--", linewidth=1.5, label="Current (k=35)")
+    ax.set_xlabel("Number of open SPs (k)")
+    ax.set_ylabel("Annual cost (€M / year)")
+    ax.set_title("Cost Components vs. k")
+    ax.legend(fontsize=7, loc="upper left")
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"€{x:.1f}M"))
+    ax.spines[["top", "right"]].set_visible(False)
+
+    # 5b. Max customer distance vs k
+    ax = axes[1]
+    ax.fill_between(sweep_df["k"], sweep_df["max_dist_km"],
+                    alpha=0.2, color=CORAL)
+    ax.plot(sweep_df["k"], sweep_df["max_dist_km"],
+            color=CORAL, linewidth=2, label="Max dist to nearest SP")
+    ax.plot(sweep_df["k"], sweep_df["avg_dist_km"],
+            color=TEAL, linewidth=2, linestyle="--", label="Avg dist (demand-weighted)")
+    ax.axhline(3.0, color=GRAY, linestyle=":", linewidth=1.2,
+               label="3 km coverage threshold")
+    ax.axvline(35, color="red", linestyle="--", linewidth=1.5)
+    ax.set_xlabel("Number of open SPs (k)")
+    ax.set_ylabel("Distance (km)")
+    ax.set_title("Service Coverage vs. k")
+    ax.legend(fontsize=7)
+    ax.spines[["top", "right"]].set_visible(False)
+
+    # 5c. Pareto frontier: cost vs max distance
+    ax = axes[2]
+    all_costs = [r.total_cost / 1e6 for r in all_k_results]
+    all_dists = [r.max_dist_km      for r in all_k_results]
+    par_costs = [r.total_cost / 1e6 for r in pareto]
+    par_dists = [r.max_dist_km      for r in pareto]
+
+    sc = ax.scatter(all_costs, all_dists,
+                    c=range(1, 36), cmap="Blues", s=40, zorder=1,
+                    label="All k (top-K baseline)")
+    ax.plot(par_costs, par_dists, "o-",
+            color=ORANGE, linewidth=2, markersize=7, zorder=2,
+            label="Pareto frontier")
+    # Annotate status quo
+    ax.annotate(
+        f"k=35\n(€{ref.total_cost/1e6:.2f}M)",
+        xy=(ref.total_cost / 1e6, ref.max_dist_km),
+        xytext=(ref.total_cost / 1e6 - 0.15, ref.max_dist_km + 1.0),
+        fontsize=7, color=NAVY,
+        arrowprops=dict(arrowstyle="->", color=NAVY, lw=1),
+    )
+    cbar = plt.colorbar(sc, ax=ax)
+    cbar.set_label("k (number of SPs)", fontsize=7)
+    ax.set_xlabel("Total cost (€M / year)")
+    ax.set_ylabel("Max distance to nearest SP (km)")
+    ax.set_title("Pareto Frontier: Cost vs. Coverage")
+    ax.legend(fontsize=7)
+    ax.spines[["top", "right"]].set_visible(False)
+
+    plt.tight_layout()
+    plt.savefig("baseline_cost_coverage.png", dpi=150, bbox_inches="tight")
+    plt.close()
+    print("\nSaved: baseline_cost_coverage.png")
+
+    # ── 6. Final summary ──────────────────────────────────────────────────────
+    opt_k_row = sweep_df.loc[sweep_df["total_cost"].idxmin()]
+    print("\n" + "=" * 60)
+    print("  BASELINE SUMMARY")
+    print("=" * 60)
+    print(f"  Status quo (35 SPs):  €{ref.total_cost:>10,.0f} / year")
+    print(f"  Minimum cost (top-K): €{opt_k_row['total_cost']:>10,.0f} / year  "
+          f"(k={int(opt_k_row['k'])})")
+    print(f"  Potential saving:     €{ref.total_cost - opt_k_row['total_cost']:>10,.0f} / year  "
+          f"(naive top-K heuristic only)")
+    print(f"\n  NOTE: Top-K is a naive baseline. Your optimisation method should")
+    print(f"  do significantly better by choosing *which* SPs to open, not just how many.")
+    print("\n  For other team members:")
+    print("    from baseline_model import PostLNetwork, evaluate, EvaluationResult")
+    print("    net = PostLNetwork.load_cache('postl_cache.pkl')")
+    print("    result = evaluate(net, your_sp_indices_list)")
+    print("=" * 60)

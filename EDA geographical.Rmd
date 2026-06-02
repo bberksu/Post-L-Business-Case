@@ -1,0 +1,712 @@
+---
+title: "EDA Elizaveta Case 2"
+output: pdf_document
+date: "2026-05-20"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+How much demand do we have in total, and how is it split between delivery and pickup?
+
+```{r}
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(ggrepel)
+
+path <- "/Users/macbook/Desktop/logistics case elab/data_Maastricht_2025.xlsx"
+
+sp <- read_excel(path, sheet = "Service Point Locations")
+activity <- read_excel(path, sheet = "Daily Activity")
+cbs <- read_excel(path, sheet = "CBS Squares")
+nodes <- read_excel(path, sheet = "Nodes")
+edges <- read_excel(path, sheet = "Edges", .name_repair = "minimal") %>%
+  select(-9)
+
+activity_summary <- activity %>%
+  summarise(
+    total_deliveries = sum(Deliveries),
+    total_pickups = sum(Pickups),
+    total_demand = total_deliveries + total_pickups,
+    delivery_share = round(total_deliveries / total_demand, 3),
+    pickup_share = round(total_pickups / total_demand, 3),
+    avg_daily_demand = round(total_demand / 365, 1)
+  )
+
+activity_summary
+```
+
+In 2025, total parcel demand in Maastricht was 1,351,852 packages. Of these, 482,442 were home deliveries and 869,410 were pickups. This means that pickups accounted for approximately 64.3% of total demand, while home deliveries accounted for 35.7%. On average, Maastricht had around 3,704 parcel movements per day.
+
+
+```{r}
+ggplot() +
+  geom_segment(
+    data = edges,
+    aes(x = X1, y = Y1, xend = X2, yend = Y2),
+    color = "grey82",
+    linewidth = 0.2
+  ) +
+  geom_point(
+    data = sp,
+    aes(x = X, y = Y),
+    color = "red",
+    size = 2
+  ) +
+  geom_text_repel(
+    data = sp,
+    aes(x = X, y = Y, label = `Location ID`),
+    size = 2.7,
+    family = "serif",
+    max.overlaps = Inf,
+    segment.color = "grey35",
+    segment.size = 0.25,
+    min.segment.length = 0,
+    box.padding = 0.35,
+    point.padding = 0.25
+  ) +
+  coord_equal(expand = FALSE) +
+  theme_minimal(base_family = "serif") +
+  labs(
+    title = "Service Points on Maastricht Street Network",
+    x = NULL,
+    y = NULL
+  ) +
+  theme(
+    plot.title = element_text(size = 18, face = "bold", hjust = 0.5),
+    axis.text = element_text(size = 8),
+    plot.margin = margin(3, 3, 3, 3)
+  )
+```
+```{r}
+library(sp)
+library(raster)
+library(ggspatial)
+library(prettymapr)
+library(sf)
+library(ggspatial)
+library(stringr)
+cbs_coord <- cbs %>%
+  filter(!is.na(X), !is.na(Y)) %>%
+  mutate(
+    rd_x = as.numeric(str_extract(Square, "(?<=E)\\d+")) * 100,
+    rd_y = as.numeric(str_extract(Square, "(?<=N)\\d+")) * 100
+  )
+
+model_x <- lm(rd_x ~ X, data = cbs_coord)
+model_y <- lm(rd_y ~ Y, data = cbs_coord)
+
+sp_rd <- sp %>%
+  mutate(
+    rd_x = predict(model_x, newdata = sp),
+    rd_y = predict(model_y, newdata = sp)
+  )
+
+edges_rd <- edges %>%
+  mutate(
+    rd_x1 = predict(model_x, newdata = data.frame(X = X1)),
+    rd_y1 = predict(model_y, newdata = data.frame(Y = Y1)),
+    rd_x2 = predict(model_x, newdata = data.frame(X = X2)),
+    rd_y2 = predict(model_y, newdata = data.frame(Y = Y2))
+  )
+
+sp_sf <- st_as_sf(
+  sp_rd,
+  coords = c("rd_x", "rd_y"),
+  crs = 28992
+)
+
+x_buffer <- 1500
+y_buffer <- 1500
+
+ggplot() +
+  annotation_map_tile(type = "osm", zoom = 13) +
+  geom_point(
+    data = sp_rd,
+    aes(x = rd_x, y = rd_y),
+    color = "red",
+    size = 1.6
+  ) +
+  geom_text_repel(
+    data = sp_rd,
+    aes(x = rd_x, y = rd_y, label = `Location ID`),
+    size = 1.7,
+    family = "serif",
+    max.overlaps = Inf,
+    segment.color = "grey35",
+    segment.size = 0.12,
+    min.segment.length = 0
+  ) +
+  coord_sf(
+    crs = 28992,
+    xlim = c(min(sp_rd$rd_x) - x_buffer, max(sp_rd$rd_x) + x_buffer),
+    ylim = c(min(sp_rd$rd_y) - y_buffer, max(sp_rd$rd_y) + y_buffer),
+    expand = FALSE
+  ) +
+  theme_void(base_family = "serif") +
+  labs(
+    title = "Service Points on Maastricht Map"
+  ) +
+  theme(
+    plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+    plot.margin = margin(1, 1, 1, 1)
+  )
+
+ggsave(
+  "service_points_maastricht_map.png",
+  width = 12,
+  height = 7,
+  dpi = 300
+)
+```
+
+The map shows that service points are concentrated around the central and western parts of Maastricht, while the eastern and nothern outskirts have fewer and more dispersed service points. This suggests that accessibility may vary across the city. However, to determine whether these areas are truly underserved, the service point map must be compared with CBS population squares and estimated demand.
+
+```{r}
+x_min <- min(sp_rd$rd_x) - 1000
+x_max <- max(sp_rd$rd_x) + 1000
+y_min <- min(sp_rd$rd_y) - 1000
+y_max <- max(sp_rd$rd_y) + 1000
+
+x_breaks <- seq(x_min, x_max, length.out = 4) 
+y_breaks <- seq(y_min, y_max, length.out = 3) 
+
+plot_city_part <- function(col, row) {
+  
+  xlim_part <- c(x_breaks[col], x_breaks[col + 1])
+  ylim_part <- c(y_breaks[row], y_breaks[row + 1])
+  
+  sp_part <- sp_rd %>%
+    filter(
+      rd_x >= xlim_part[1],
+      rd_x <= xlim_part[2],
+      rd_y >= ylim_part[1],
+      rd_y <= ylim_part[2]
+    )
+  
+  ggplot() +
+    annotation_map_tile(type = "osm", zoom = 14) +
+    geom_point(
+      data = sp_part,
+      aes(x = rd_x, y = rd_y),
+      color = "red",
+      size = 2
+    ) +
+    geom_text_repel(
+      data = sp_part,
+      aes(x = rd_x, y = rd_y, label = `Location ID`),
+      size = 2,
+      family = "serif",
+      max.overlaps = Inf,
+      segment.color = "grey35",
+      segment.size = 0.15,
+      min.segment.length = 0
+    ) +
+    coord_sf(
+      crs = 28992,
+      xlim = xlim_part,
+      ylim = ylim_part,
+      expand = FALSE
+    ) +
+    theme_void(base_family = "serif") +
+    labs(
+      title = paste("Maastricht Service Points - Area", row, col)
+    ) +
+    theme(
+      plot.title = element_text(size = 12, face = "bold", hjust = 0.5),
+      plot.margin = margin(1, 1, 1, 1)
+    )
+}
+
+plot_city_part(1, 1)
+plot_city_part(2, 1)
+plot_city_part(3, 1)
+
+plot_city_part(1, 2)
+plot_city_part(2, 2)
+plot_city_part(3, 2)
+
+ggsave("maastricht_area_1_1.png", plot_city_part(1, 1), width = 8, height = 6, dpi = 300)
+ggsave("maastricht_area_2_1.png", plot_city_part(2, 1), width = 8, height = 6, dpi = 300)
+ggsave("maastricht_area_3_1.png", plot_city_part(3, 1), width = 8, height = 6, dpi = 300)
+
+ggsave("maastricht_area_1_2.png", plot_city_part(1, 2), width = 8, height = 6, dpi = 300)
+ggsave("maastricht_area_2_2.png", plot_city_part(2, 2), width = 8, height = 6, dpi = 300)
+ggsave("maastricht_area_3_2.png", plot_city_part(3, 2), width = 8, height = 6, dpi = 300)
+```
+
+```{r}
+cbs_known <- cbs %>%
+  filter(!is.na(Population))
+
+cbs_rd <- cbs_known %>%
+  mutate(
+    rd_x = predict(model_x, newdata = cbs_known),
+    rd_y = predict(model_y, newdata = cbs_known)
+  )
+
+ggplot() +
+  annotation_map_tile(type = "cartolight", zoom = 13) +
+  geom_point(
+    data = cbs_rd,
+    aes(x = rd_x, y = rd_y, color = Population),
+    size = 3.8,
+    alpha = 0.65
+  ) +
+  geom_point(
+    data = sp_rd,
+    aes(x = rd_x, y = rd_y),
+    color = "white",
+    fill = "#D7191C",
+    shape = 21,
+    stroke = 0.5,
+    size = 2.4
+  ) +
+  scale_color_viridis_c(
+    option = "magma",
+    name = "Population",
+    labels = scales::comma
+  ) +
+  coord_sf(
+    crs = 28992,
+    xlim = c(min(sp_rd$rd_x) - 1500, max(sp_rd$rd_x) + 1500),
+    ylim = c(min(sp_rd$rd_y) - 1500, max(sp_rd$rd_y) + 1500),
+    expand = FALSE
+  ) +
+  theme_void(base_family = "serif") +
+  labs(
+    title = "Population Distribution and Service Points"
+  ) +
+  theme(
+    plot.title = element_text(size = 15, face = "bold", hjust = 0.5),
+    legend.position = "right",
+    legend.title = element_text(size = 10, face = "bold"),
+    legend.text = element_text(size = 9),
+    plot.margin = margin(2, 2, 2, 2)
+  )
+```
+
+This map shows the spatial distribution of population across CBS squares and the locations of existing service points in Maastricht. Each circle represents a CBS square, with lighter and warmer colours indicating higher population. Red points represent service points. The highest population concentrations are mainly located in the central, western, and southern parts of Maastricht. Many service points are located close to these high-population areas, suggesting that the current network broadly follows demand potential. However, some populated areas, especially toward the northern and eastern edges of the city, appear to have fewer nearby service points. This indicates that distance to the nearest service point should be examined further to identify potentially underserved areas.
+
+```{r}
+nearest_assignments <- cbs_rd %>%
+  tidyr::crossing( 
+    sp_rd %>%
+      dplyr::select(`Location ID`, sp_x = rd_x, sp_y = rd_y)
+  ) %>%
+  dplyr::mutate(
+    dist_km = sqrt((rd_x - sp_x)^2 + (rd_y - sp_y)^2) / 1000
+  ) %>%
+  dplyr::group_by(Square) %>%
+  dplyr::slice_min(dist_km, n = 1, with_ties = FALSE) %>%
+  dplyr::ungroup()
+
+underserved <- nearest_assignments %>%
+  dplyr::mutate(
+    underserved_score = Population * dist_km
+  ) %>%
+  dplyr::arrange(desc(underserved_score))
+
+underserved %>%
+  dplyr::select(Square, Population, `Location ID`, dist_km, underserved_score) %>%
+  head(10)
+
+ggplot() +
+  annotation_map_tile(type = "cartolight", zoom = 13) +
+  geom_point(
+    data = nearest_assignments,
+    aes(x = rd_x, y = rd_y, color = dist_km, size = Population),
+    alpha = 0.65
+  ) +
+  geom_point(
+    data = sp_rd,
+    aes(x = rd_x, y = rd_y),
+    color = "white",
+    fill = "#D7191C",
+    shape = 21,
+    stroke = 0.5,
+    size = 2.3
+  ) +
+  scale_color_viridis_c(
+    option = "plasma",
+    name = "Distance to nearest\nservice point, km"
+  ) +
+  scale_size_continuous(
+    range = c(1, 5),
+    name = "Population"
+  ) +
+  coord_sf(
+    crs = 28992,
+    xlim = c(min(sp_rd$rd_x) - 1500, max(sp_rd$rd_x) + 1500),
+    ylim = c(min(sp_rd$rd_y) - 1500, max(sp_rd$rd_y) + 1500),
+    expand = FALSE
+  ) +
+  theme_void(base_family = "serif") +
+  labs(
+    title = "Distance to Nearest Service Point by CBS Square"
+  ) +
+  theme(
+    plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+    legend.position = "right",
+    legend.title = element_text(size = 9, face = "bold"),
+    legend.text = element_text(size = 8)
+  )
+
+```
+
+Most populated CBS squares are within short distance of a service point, but some peripheral areas, especially in the north-east and east, show longer access distances. These areas are potential candidates for further analysis or improved service point coverage.
+
+```{r}
+ggplot(nearest_assignments, aes(x = dist_km, y = Population)) +
+  geom_point(
+    aes(color = dist_km),
+    alpha = 0.75,
+    size = 2.6
+  ) +
+  geom_vline(
+    xintercept = 1,
+    linetype = "dashed",
+    color = "#D7191C",
+    linewidth = 0.8
+  ) +
+  scale_color_viridis_c(
+    option = "plasma",
+    name = "Distance, km"
+  ) +
+  theme_minimal(base_family = "serif") +
+  labs(
+    title = "Population vs Distance to Nearest Service Point",
+    subtitle = "CBS squares to the right of the dashed line are more than 1 km from their nearest service point",
+    x = "Distance to nearest service point, km",
+    y = "Population"
+  ) +
+  theme(
+    plot.title = element_text(size = 15, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 10, hjust = 0.5),
+    axis.title = element_text(size = 11),
+    axis.text = element_text(size = 9),
+    legend.position = "right"
+  )
+```
+This scatter plot compares the population of each CBS square with its distance to the nearest service point. Each point represents one CBS square. The dashed red line marks a 1 km threshold: squares to the right of this line are more than 1 km away from their nearest service point. The plot shows that most high-population CBS squares are located within 1 km of a service point. Squares located farther than 1 km generally have low population, which suggests that the most populated areas are relatively well covered by the current service point network.
+
+```{r}
+nearest_assignments <- nearest_assignments %>%
+  mutate(
+    underserved_flag = ifelse(dist_km > 1 & Population > 1000, "Potentially underserved", "Other")
+  )
+
+ggplot(nearest_assignments, aes(x = dist_km, y = Population)) +
+  geom_point(
+    aes(color = underserved_flag),
+    alpha = 0.75,
+    size = 2.5
+  ) +
+  geom_vline(
+    xintercept = 1,
+    linetype = "dashed",
+    color = "grey30"
+  ) +
+  scale_color_manual(
+    values = c(
+      "Potentially underserved" = "#D7191C",
+      "Other" = "grey55"
+    )
+  ) +
+  theme_minimal(base_family = "serif") +
+  labs(
+    title = "Potentially Underserved CBS Squares",
+    subtitle = "Defined as population > 1,000 and distance to nearest service point > 1 km",
+    x = "Distance to nearest service point, km",
+    y = "Population",
+    color = NULL
+  ) +
+  theme(
+    plot.title = element_text(size = 15, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 10, hjust = 0.5),
+    legend.position = "bottom"
+  )
+```
+This plot highlights CBS squares that may be underserved based on two criteria: population above 1,000 and distance to the nearest service point above 1 km. Grey points represent all other CBS squares, while red points represent potentially underserved areas. Only a small number of CBS squares meet both conditions. This suggests that most high-population areas are already located within 1 km of a service point, while the more distant squares usually have lower population.
+
+```{r}
+total_annual_demand <- sum(activity$Deliveries + activity$Pickups, na.rm = TRUE)
+actual_pickup_share <- sum(activity$Pickups, na.rm = TRUE) / total_annual_demand
+actual_delivery_share <- sum(activity$Deliveries, na.rm = TRUE) / total_annual_demand
+
+actual_by_sp <- activity %>%
+  group_by(`Location ID`) %>%
+  summarise(
+    actual_deliveries = sum(Deliveries, na.rm = TRUE),
+    actual_pickups = sum(Pickups, na.rm = TRUE),
+    actual_total = actual_deliveries + actual_pickups,
+    actual_pickup_share = actual_pickups / actual_total,
+    .groups = "drop"
+  )
+
+assigned_pop <- nearest_assignments %>%
+  group_by(`Location ID`) %>%
+  summarise(
+    assigned_population = sum(Population, na.rm = TRUE),
+    avg_distance_km = weighted.mean(dist_km, Population, na.rm = TRUE),
+    n_squares = n(),
+    .groups = "drop"
+  )
+
+eda_by_sp <- actual_by_sp %>%
+  left_join(assigned_pop, by = "Location ID")
+eda_by_sp %>%
+  arrange(desc(actual_total))
+```
+
+This table summarizes demand and accessibility at the service point level. For each service point, it shows the observed annual number of deliveries, pickups, total parcel activity, pickup share, assigned population, average distance from assigned CBS squares, and the number of CBS squares served. The service points are sorted by total parcel activity, so the top rows represent the busiest locations in the network.
+
+The table shows substantial variation between service points. Some locations combine high demand with short average distance to assigned CBS squares, suggesting strong accessibility. However, service point 5820 stands out: it has the largest assigned population and a much higher average distance, while its pickup share is relatively low. This supports the assumption that distance may influence the likelihood of pickup versus home delivery.
+
+
+```{r}
+sp_demand <- sp_rd %>%
+  left_join(actual_by_sp, by = "Location ID")
+
+ggplot() +
+  annotation_map_tile(type = "cartolight", zoom = 13) +
+  
+  geom_point(
+    data = nearest_assignments,
+    aes(x = rd_x, y = rd_y, color = dist_km, size = Population),
+    alpha = 0.55
+  ) +
+  
+  geom_point(
+    data = nearest_assignments %>% filter(underserved_flag == "Potentially underserved"),
+    aes(x = rd_x, y = rd_y),
+    shape = 21,
+    fill = NA,
+    color = "#D7191C",
+    stroke = 1.1,
+    size = 5
+  ) +
+  
+  geom_point(
+    data = sp_demand,
+    aes(x = rd_x, y = rd_y, size = actual_total),
+    shape = 21,
+    fill = "#D7191C",
+    color = "white",
+    stroke = 0.6,
+    alpha = 0.95
+  ) +
+  
+  scale_color_viridis_c(
+    option = "plasma",
+    name = "Distance to nearest\nservice point, km"
+  ) +
+  
+  scale_size_continuous(
+    range = c(1.5, 6),
+    name = "Population / demand"
+  ) +
+  
+  coord_sf(
+    crs = 28992,
+    xlim = c(min(sp_rd$rd_x) - 1500, max(sp_rd$rd_x) + 1500),
+    ylim = c(min(sp_rd$rd_y) - 1500, max(sp_rd$rd_y) + 1500),
+    expand = FALSE
+  ) +
+  
+  theme_void(base_family = "serif") +
+  labs(
+    title = "Accessibility Pressure Around Maastricht Service Points",
+    subtitle = "CBS population, distance to nearest service point, and actual service point demand"
+  ) +
+  theme(
+    plot.title = element_text(size = 15, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 9, hjust = 0.5),
+    legend.position = "right",
+    legend.title = element_text(size = 9, face = "bold"),
+    legend.text = element_text(size = 8)
+  )
+
+ggplot() +
+  annotation_map_tile(type = "cartolight", zoom = 13) +
+  geom_point(
+    data = nearest_assignments,
+    aes(x = rd_x, y = rd_y, color = factor(`Location ID`), size = Population),
+    alpha = 0.65
+  ) +
+  geom_point(
+    data = sp_rd,
+    aes(x = rd_x, y = rd_y),
+    shape = 21,
+    fill = "#D7191C",
+    color = "white",
+    stroke = 0.6,
+    size = 2.8
+  ) +
+  coord_sf(
+    crs = 28992,
+    xlim = c(min(sp_rd$rd_x) - 1500, max(sp_rd$rd_x) + 1500),
+    ylim = c(min(sp_rd$rd_y) - 1500, max(sp_rd$rd_y) + 1500),
+    expand = FALSE
+  ) +
+  theme_void(base_family = "serif") +
+  guides(color = "none") +
+  labs(
+    title = "Estimated Catchment Areas of Service Points",
+    subtitle = "Each CBS square is assigned to its nearest service point"
+  ) +
+  theme(
+    plot.title = element_text(size = 15, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 9, hjust = 0.5)
+  )
+```
+The accessibility map shows that the busiest service points are mainly located in central and western Maastricht, where population density is also relatively high and distances to service points are mostly short. Peripheral CBS squares, especially toward the north-east and east, have longer distances but generally lower population. This suggests that the main network pressure is concentrated around central service points rather than in remote areas.
+
+The catchment map reveals that service point catchment areas are uneven. Some service points serve compact areas with nearby CBS squares, while others cover larger and more dispersed areas. This is especially visible around peripheral service points, where assigned CBS squares are spread over wider distances. The catchment map helps identify which service points may face higher demand pressure or lower accessibility due to larger service areas.
+
+```{r}
+library(patchwork)
+
+sp_demand <- sp_rd %>%
+  left_join(actual_by_sp, by = "Location ID")
+
+top_sp <- actual_by_sp %>%
+  arrange(desc(actual_total)) %>%
+  slice_head(n = 10) %>%
+  mutate(`Location ID` = factor(`Location ID`, levels = rev(`Location ID`)))
+
+p_map <- ggplot() +
+  annotation_map_tile(type = "cartolight", zoom = 13) +
+  geom_point(
+    data = nearest_assignments,
+    aes(x = rd_x, y = rd_y, color = dist_km, size = Population),
+    alpha = 0.65
+  ) +
+  geom_point(
+    data = sp_demand,
+    aes(x = rd_x, y = rd_y),
+    shape = 21,
+    fill = "#D7191C",
+    color = "white",
+    stroke = 0.6,
+    size = 2.5
+  ) +
+  scale_color_viridis_c(
+    option = "plasma",
+    name = "Distance, km"
+  ) +
+  scale_size_continuous(
+    range = c(0.8, 4.5),
+    name = "Population"
+  ) +
+  coord_sf(
+    crs = 28992,
+    xlim = c(min(sp_rd$rd_x) - 1500, max(sp_rd$rd_x) + 1500),
+    ylim = c(min(sp_rd$rd_y) - 1500, max(sp_rd$rd_y) + 1500),
+    expand = FALSE
+  ) +
+  theme_void(base_family = "serif") +
+  labs(title = "Accessibility and Population") +
+  theme(
+    plot.title = element_text(size = 12, face = "bold", hjust = 0.5),
+    legend.title = element_text(size = 8, face = "bold"),
+    legend.text = element_text(size = 7)
+  )
+
+p_scatter <- ggplot(nearest_assignments, aes(x = dist_km, y = Population)) +
+  geom_point(aes(color = underserved_flag), alpha = 0.75, size = 2) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "grey30") +
+  scale_color_manual(
+    values = c(
+      "Potentially underserved" = "#D7191C",
+      "Other" = "grey60"
+    )
+  ) +
+  theme_minimal(base_family = "serif") +
+  labs(
+    title = "Underserved Candidates",
+    x = "Distance, km",
+    y = "Population",
+    color = NULL
+  ) +
+  theme(
+    plot.title = element_text(size = 11, face = "bold", hjust = 0.5),
+    axis.title = element_text(size = 8),
+    axis.text = element_text(size = 7),
+    legend.position = "bottom",
+    legend.text = element_text(size = 7)
+  )
+
+top_sp <- actual_by_sp %>%
+  arrange(desc(actual_total)) %>%
+  slice_head(n = 5) %>%
+  mutate(
+    rank = row_number(),
+    location_label = paste0("#", rank, "  ", `Location ID`),
+    location_label = factor(location_label, levels = rev(location_label))
+  )
+
+p_bar <- ggplot(top_sp, aes(x = actual_total, y = location_label)) +
+  geom_segment(
+    aes(x = 0, xend = actual_total, y = location_label, yend = location_label),
+    color = "grey75",
+    linewidth = 1.2
+  ) +
+  geom_point(
+    aes(size = actual_pickup_share),
+    color = "#D7191C",
+    alpha = 0.9
+  ) +
+  scale_x_continuous(
+    labels = scales::label_number(scale_cut = scales::cut_short_scale()),
+    expand = expansion(mult = c(0, 0.08))
+  ) +
+  scale_size_continuous(
+    range = c(2.5, 4.5),
+    guide = "none"
+  ) +
+  theme_minimal(base_family = "serif") +
+  labs(
+    title = "Busiest Service Points",
+    subtitle = "Dot size reflects pickup share",
+    x = "Annual parcel activity",
+    y = NULL
+  ) +
+  theme(
+    plot.title = element_text(size = 11, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 8, hjust = 0.5),
+    axis.title.x = element_text(size = 8),
+    axis.text.y = element_text(size = 8.5, face = "bold"),
+    axis.text.x = element_text(size = 7),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.margin = margin(4, 6, 4, 4)
+  )
+
+right_panel <- p_scatter / p_bar +
+  plot_layout(heights = c(0.85, 1.15))
+
+dashboard <- p_map | right_panel
+
+dashboard +
+  plot_layout(widths = c(1.55, 1)) +
+  plot_annotation(
+    title = "Geographical EDA Summary of Maastricht Service Points",
+    subtitle = "Population, accessibility, underserved areas, and actual service point demand",
+    theme = theme(
+      plot.title = element_text(size = 17, face = "bold", hjust = 0.5, family = "serif"),
+      plot.subtitle = element_text(size = 10, hjust = 0.5, family = "serif")
+    )
+  )
+
+
+ggsave(
+  "geographical_eda_dashboard.png",
+  width = 14,
+  height = 8,
+  dpi = 300
+)
+```

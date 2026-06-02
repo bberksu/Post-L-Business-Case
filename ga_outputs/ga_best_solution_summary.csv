@@ -1,0 +1,2 @@
+total_cost,fixed_cost,delivery_cost,storage_cost,penalty_cost,city_bounce_rate,max_location_bounce_rate,open_locations,annual_pickups,annual_deliveries,avg_distance_km,apl_operating_cost,closure_penalty,apl_complexity_penalty
+2090847.5069372891,840000.0,798652.2943878567,167203.82802114805,3399.439085591993,0.0005990694043208763,0.009681108388491474,21,836019.1401057402,515832.85989425983,0.8528995140755765,63591.945442692326,200000.0,18000.0

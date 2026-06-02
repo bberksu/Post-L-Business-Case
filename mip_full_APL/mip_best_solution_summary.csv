@@ -1,0 +1,2 @@
+fixed_cost,delivery_cost,storage_cost,apl_operating_cost,penalty_cost,total_cost,open_locations,open_service_points,open_apls,annual_pickups,annual_deliveries,pickup_share,avg_distance_km,max_distance_km,city_bounce_rate,max_location_bounce_rate,solver_status,solver_objective,apl_candidate_count,candidate_setting
+615000.0,375872.48231990007,192160.723954218,390211.1250448507,1246.3034522602193,1574490.634771229,41,0,41,960803.6197710899,391048.3802289101,0.7107313668738071,0.4627778818503275,4.20218225511,0.0,0.0,Optimal,1574490.6347712283,216,ALL

@@ -1,0 +1,659 @@
+import pandas as pd
+import numpy as np
+import networkx as nx
+from pathlib import Path
+
+# =====================================================
+# 1. LOAD DATA
+# =====================================================
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+file_path = BASE_DIR / "data" / "data_Maastricht_2025.xlsx"
+
+daily_activity = pd.read_excel(file_path, sheet_name="Daily Activity")
+service_points = pd.read_excel(file_path, sheet_name="Service Point Locations")
+cbs_squares = pd.read_excel(file_path, sheet_name="CBS Squares")
+nodes = pd.read_excel(file_path, sheet_name="Nodes")
+edges = pd.read_excel(file_path, sheet_name="Edges")
+
+print("Data loaded successfully.")
+
+# =====================================================
+# 2. BUILD ROAD NETWORK
+# =====================================================
+
+G = nx.DiGraph()
+
+for _, row in edges.iterrows():
+    start = row["V1"]
+    end = row["V2"]
+    dist = row["DIST"]
+
+    G.add_edge(start, end, weight=dist)
+
+    if row["ONE_WAY"] == False:
+        G.add_edge(end, start, weight=dist)
+
+print(f"Road network created: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
+
+# =====================================================
+# 3. MATCH CBS SQUARES AND SERVICE POINTS TO NEAREST NODE
+# =====================================================
+
+node_positions = {}
+
+for _, row in nodes.iterrows():
+    node_positions[row["NODE ID"]] = (row["X"], row["Y"])
+
+
+def find_nearest_node(x, y, node_positions):
+    closest_node = None
+    min_distance = float("inf")
+
+    for node_id, (node_x, node_y) in node_positions.items():
+        dist = ((x - node_x) ** 2 + (y - node_y) ** 2) ** 0.5
+
+        if dist < min_distance:
+            min_distance = dist
+            closest_node = node_id
+
+    return closest_node
+
+
+service_points["nearest_node"] = service_points.apply(
+    lambda row: find_nearest_node(row["X"], row["Y"], node_positions),
+    axis=1
+)
+
+cbs_squares["nearest_node"] = cbs_squares.apply(
+    lambda row: find_nearest_node(row["X"], row["Y"], node_positions),
+    axis=1
+)
+
+# Keep only squares with population
+cbs_clean = cbs_squares.dropna(subset=["Population"]).copy()
+
+print(f"Valid CBS squares: {len(cbs_clean)}")
+
+# =====================================================
+# 4. BASELINE ASSIGNMENT
+# =====================================================
+
+assignments = []
+
+for _, square in cbs_clean.iterrows():
+    square_id = square["Square"]
+    square_node = square["nearest_node"]
+
+    best_sp = None
+    best_distance = float("inf")
+
+    for _, sp in service_points.iterrows():
+        sp_id = sp["Location ID"]
+        sp_node = sp["nearest_node"]
+
+        try:
+            dist = nx.shortest_path_length(
+                G,
+                source=square_node,
+                target=sp_node,
+                weight="weight"
+            ) / 1000
+
+            if dist < best_distance:
+                best_distance = dist
+                best_sp = sp_id
+
+        except:
+            continue
+
+    assignments.append({
+        "Square": square_id,
+        "Population": square["Population"],
+        "Assigned_SP": best_sp,
+        "Distance_km": best_distance
+    })
+
+assignments_df = pd.DataFrame(assignments)
+
+# =====================================================
+# 5. DEMAND ESTIMATION
+# =====================================================
+
+TOTAL_PARCELS = 1351852
+total_population = cbs_clean["Population"].sum()
+demand_factor = TOTAL_PARCELS / total_population
+
+assignments_df["Annual_Demand"] = assignments_df["Population"] * demand_factor
+
+print(f"Total population: {total_population:,.0f}")
+print(f"Demand factor: {demand_factor:.4f}")
+print(f"Estimated demand: {assignments_df['Annual_Demand'].sum():,.0f}")
+
+# =====================================================
+# 6. PARAMETERS
+# =====================================================
+
+FIXED_COST_SP = 50000
+FIXED_COST_APL = 50000
+
+DELIVERY_COST_PER_KM = 1.5
+STORAGE_COST_PER_PICKUP = 0.1
+
+MIN_OPEN_LOCATIONS = 28
+MAX_OPEN_LOCATIONS = 42
+
+MAX_ITERATIONS = 40
+
+MAX_AVG_DISTANCE_KM = 2.00
+MAX_DISTANCE_KM = 5.50
+
+LONG_DISTANCE_THRESHOLD = 3.0
+LONG_DISTANCE_PENALTY_PER_PERSON_KM = 2.0
+
+CAPACITY_BUFFER = 1.20
+CAPACITY_PENALTY_PER_EXTRA_PICKUP = 8.0
+
+BOUNCE_LIMIT_CITY = 0.01
+BOUNCE_LIMIT_LOCATION = 0.02
+BOUNCE_PENALTY = 50000
+
+N_APL_CANDIDATES = 25
+
+# =====================================================
+# 7. PICKUP PROBABILITY
+# =====================================================
+
+def pickup_probability(distance_km):
+    if distance_km <= 0.5:
+        return 0.78
+    elif distance_km <= 1:
+        return 0.72
+    elif distance_km <= 2:
+        return 0.62
+    elif distance_km <= 3:
+        return 0.50
+    elif distance_km <= 4:
+        return 0.35
+    else:
+        return 0.22
+
+# =====================================================
+# 8. CAPACITY FROM DAILY ACTIVITY
+# =====================================================
+
+daily_pickups_sp = (
+    daily_activity
+    .groupby("Location ID")
+    .agg(
+        avg_daily_pickups=("Pickups", "mean"),
+        peak_daily_pickups=("Pickups", "max"),
+        std_daily_pickups=("Pickups", "std")
+    )
+    .reset_index()
+)
+
+daily_pickups_sp["capacity"] = daily_pickups_sp["peak_daily_pickups"] * CAPACITY_BUFFER
+
+capacity_dict = dict(
+    zip(daily_pickups_sp["Location ID"], daily_pickups_sp["capacity"])
+)
+
+# =====================================================
+# 9. CREATE APL CANDIDATES
+# =====================================================
+
+apl_candidates = (
+    assignments_df
+    .copy()
+    .sort_values(["Distance_km", "Population"], ascending=[False, False])
+    .head(N_APL_CANDIDATES)
+)
+
+apl_locations = {}
+
+for _, row in apl_candidates.iterrows():
+    apl_id = f"APL_{row['Square']}"
+
+    apl_node = cbs_clean.loc[
+        cbs_clean["Square"] == row["Square"],
+        "nearest_node"
+    ].iloc[0]
+
+    apl_locations[apl_id] = {
+        "nearest_node": apl_node,
+        "fixed_cost": FIXED_COST_APL,
+        "type": "APL"
+    }
+
+print(f"Created {len(apl_locations)} APL candidates.")
+
+# =====================================================
+# 10. LOCATION DICTIONARY
+# =====================================================
+
+location_nodes = {}
+
+for _, row in service_points.iterrows():
+    sp_id = row["Location ID"]
+
+    location_nodes[sp_id] = {
+        "nearest_node": row["nearest_node"],
+        "fixed_cost": FIXED_COST_SP,
+        "type": "SP"
+    }
+
+for apl_id, data in apl_locations.items():
+    location_nodes[apl_id] = data
+
+# =====================================================
+# 11. PRECOMPUTE DISTANCES
+# =====================================================
+
+print("Precomputing distances...")
+
+full_distance_dict = {}
+
+for _, square in cbs_clean.iterrows():
+    square_id = square["Square"]
+    square_node = square["nearest_node"]
+
+    full_distance_dict[square_id] = {}
+
+    for loc_id, loc_data in location_nodes.items():
+        try:
+            dist = nx.shortest_path_length(
+                G,
+                source=square_node,
+                target=loc_data["nearest_node"],
+                weight="weight"
+            ) / 1000
+
+            full_distance_dict[square_id][loc_id] = dist
+
+        except:
+            continue
+
+print("Distance precomputation completed.")
+
+# =====================================================
+# 12. EVALUATE NETWORK
+# =====================================================
+
+def evaluate_network(open_locations):
+    rows = []
+
+    for _, square in cbs_clean.iterrows():
+        square_id = square["Square"]
+        population = square["Population"]
+        annual_demand = population * demand_factor
+
+        best_location = None
+        best_distance = float("inf")
+
+        for loc_id in open_locations:
+            if loc_id in full_distance_dict[square_id]:
+                dist = full_distance_dict[square_id][loc_id]
+
+                if dist < best_distance:
+                    best_distance = dist
+                    best_location = loc_id
+
+        p_pickup = pickup_probability(best_distance)
+
+        pickups = annual_demand * p_pickup
+        deliveries = annual_demand - pickups
+
+        delivery_cost = deliveries * best_distance * DELIVERY_COST_PER_KM
+        storage_cost = pickups * STORAGE_COST_PER_PICKUP
+
+        distance_penalty = 0
+
+        if best_distance > LONG_DISTANCE_THRESHOLD:
+            distance_penalty = (
+                population *
+                (best_distance - LONG_DISTANCE_THRESHOLD) *
+                LONG_DISTANCE_PENALTY_PER_PERSON_KM
+            )
+
+        rows.append({
+            "Square": square_id,
+            "Population": population,
+            "Assigned_Location": best_location,
+            "Distance_km": best_distance,
+            "Annual_Demand": annual_demand,
+            "Pickup_Probability": p_pickup,
+            "Pickups": pickups,
+            "Deliveries": deliveries,
+            "Delivery_Cost": delivery_cost,
+            "Storage_Cost": storage_cost,
+            "Distance_Penalty": distance_penalty,
+            "Variable_Cost": delivery_cost + storage_cost + distance_penalty
+        })
+
+    solution = pd.DataFrame(rows)
+
+    fixed_cost = sum(location_nodes[loc]["fixed_cost"] for loc in open_locations)
+    variable_cost = solution["Variable_Cost"].sum()
+
+    location_load = (
+        solution
+        .groupby("Assigned_Location")
+        .agg(
+            Annual_Pickups=("Pickups", "sum"),
+            Annual_Demand=("Annual_Demand", "sum")
+        )
+        .reset_index()
+    )
+
+    location_load["Avg_Daily_Pickups"] = location_load["Annual_Pickups"] / 365
+
+    capacity_penalty = 0
+    bounce_penalty = 0
+    total_excess_pickups = 0
+
+    for _, row in location_load.iterrows():
+        loc = row["Assigned_Location"]
+        avg_daily_pickups = row["Avg_Daily_Pickups"]
+
+        if location_nodes[loc]["type"] == "SP":
+            capacity = capacity_dict.get(loc, avg_daily_pickups * 2)
+        else:
+            capacity = max(150, avg_daily_pickups * 1.5)
+
+        excess = max(0, avg_daily_pickups - capacity)
+        total_excess_pickups += excess
+
+        capacity_penalty += excess * 365 * CAPACITY_PENALTY_PER_EXTRA_PICKUP
+
+        location_bounce_rate = excess / avg_daily_pickups if avg_daily_pickups > 0 else 0
+
+        if location_bounce_rate > BOUNCE_LIMIT_LOCATION:
+            bounce_penalty += BOUNCE_PENALTY
+
+    total_avg_daily_pickups = location_load["Avg_Daily_Pickups"].sum()
+
+    city_bounce_rate = (
+        total_excess_pickups / total_avg_daily_pickups
+        if total_avg_daily_pickups > 0
+        else 0
+    )
+
+    if city_bounce_rate > BOUNCE_LIMIT_CITY:
+        bounce_penalty += BOUNCE_PENALTY
+
+    total_cost = fixed_cost + variable_cost + capacity_penalty + bounce_penalty
+
+    avg_distance = solution["Distance_km"].mean()
+    pop_weighted_distance = (
+        solution["Distance_km"] * solution["Population"]
+    ).sum() / solution["Population"].sum()
+    max_distance = solution["Distance_km"].max()
+
+    feasible = (
+        avg_distance <= MAX_AVG_DISTANCE_KM and
+        max_distance <= MAX_DISTANCE_KM
+    )
+
+    return {
+        "solution": solution,
+        "open_locations": set(open_locations),
+        "fixed_cost": fixed_cost,
+        "variable_cost": variable_cost,
+        "capacity_penalty": capacity_penalty,
+        "bounce_penalty": bounce_penalty,
+        "total_cost": total_cost,
+        "avg_distance": avg_distance,
+        "pop_weighted_distance": pop_weighted_distance,
+        "max_distance": max_distance,
+        "city_bounce_rate": city_bounce_rate,
+        "feasible": feasible
+    }
+
+# =====================================================
+# 13. LOCATION SUMMARY
+# =====================================================
+
+def location_summary(result):
+    solution = result["solution"]
+
+    summary = (
+        solution
+        .groupby("Assigned_Location")
+        .agg(
+            Population=("Population", "sum"),
+            Demand=("Annual_Demand", "sum"),
+            Pickups=("Pickups", "sum"),
+            Deliveries=("Deliveries", "sum"),
+            Avg_Distance=("Distance_km", "mean"),
+            Max_Distance=("Distance_km", "max"),
+            Delivery_Cost=("Delivery_Cost", "sum"),
+            Storage_Cost=("Storage_Cost", "sum"),
+            Distance_Penalty=("Distance_Penalty", "sum"),
+            Variable_Cost=("Variable_Cost", "sum"),
+            Squares=("Square", "count")
+        )
+        .reset_index()
+    )
+
+    summary["Type"] = summary["Assigned_Location"].apply(
+        lambda loc: location_nodes[loc]["type"]
+    )
+
+    summary["Fixed_Cost"] = summary["Assigned_Location"].apply(
+        lambda loc: location_nodes[loc]["fixed_cost"]
+    )
+
+    summary["Total_Location_Cost"] = summary["Fixed_Cost"] + summary["Variable_Cost"]
+    summary["Cost_per_Parcel"] = summary["Total_Location_Cost"] / summary["Demand"]
+    summary["Avg_Daily_Pickups"] = summary["Pickups"] / 365
+
+    return summary.sort_values("Cost_per_Parcel", ascending=False)
+
+# =====================================================
+# 14. INITIAL NETWORK
+# =====================================================
+
+initial_open_locations = set(service_points["Location ID"].unique())
+
+baseline = evaluate_network(initial_open_locations)
+current = baseline
+
+print("\nINITIAL NETWORK")
+print("=" * 60)
+print(f"Open locations: {len(current['open_locations'])}")
+print(f"Objective: €{current['total_cost']:,.0f}")
+print(f"Fixed cost: €{current['fixed_cost']:,.0f}")
+print(f"Variable cost: €{current['variable_cost']:,.0f}")
+print(f"Capacity penalty: €{current['capacity_penalty']:,.0f}")
+print(f"Bounce penalty: €{current['bounce_penalty']:,.0f}")
+print(f"Avg distance: {current['avg_distance']:.2f} km")
+print(f"Pop-weighted distance: {current['pop_weighted_distance']:.2f} km")
+print(f"Max distance: {current['max_distance']:.2f} km")
+print(f"City bounce rate: {current['city_bounce_rate']:.2%}")
+
+# =====================================================
+# 15. LOCAL SEARCH
+# =====================================================
+
+search_log = []
+
+for iteration in range(1, MAX_ITERATIONS + 1):
+    best_move = None
+    current_open = current["open_locations"]
+
+    ranked = location_summary(current)
+
+    # CLOSE operator
+    if len(current_open) > MIN_OPEN_LOCATIONS:
+        close_candidates = (
+            ranked[ranked["Type"] == "SP"]
+            ["Assigned_Location"]
+            .head(10)
+            .tolist()
+        )
+
+        for loc_to_close in close_candidates:
+            test_open = current_open.copy()
+            test_open.remove(loc_to_close)
+
+            test = evaluate_network(test_open)
+            improvement = current["total_cost"] - test["total_cost"]
+
+            if test["feasible"] and improvement > 0:
+                if best_move is None or improvement > best_move["Improvement"]:
+                    best_move = {
+                        "Operator": "CLOSE",
+                        "Move": loc_to_close,
+                        "Result": test,
+                        "Improvement": improvement
+                    }
+
+    # OPEN operator
+    if len(current_open) < MAX_OPEN_LOCATIONS:
+        closed_apls = [
+            apl for apl in apl_locations.keys()
+            if apl not in current_open
+        ]
+
+        for apl in closed_apls:
+            test_open = current_open.copy()
+            test_open.add(apl)
+
+            test = evaluate_network(test_open)
+            improvement = current["total_cost"] - test["total_cost"]
+
+            if test["feasible"] and improvement > 0:
+                if best_move is None or improvement > best_move["Improvement"]:
+                    best_move = {
+                        "Operator": "OPEN",
+                        "Move": apl,
+                        "Result": test,
+                        "Improvement": improvement
+                    }
+
+    # CLOSE + OPEN operator
+    close_candidates = (
+        ranked[ranked["Type"] == "SP"]
+        ["Assigned_Location"]
+        .head(8)
+        .tolist()
+    )
+
+    closed_apls = [
+        apl for apl in apl_locations.keys()
+        if apl not in current_open
+    ]
+
+    for loc_to_close in close_candidates:
+        for apl in closed_apls:
+            test_open = current_open.copy()
+            test_open.remove(loc_to_close)
+            test_open.add(apl)
+
+            test = evaluate_network(test_open)
+            improvement = current["total_cost"] - test["total_cost"]
+
+            if test["feasible"] and improvement > 0:
+                if best_move is None or improvement > best_move["Improvement"]:
+                    best_move = {
+                        "Operator": "CLOSE+OPEN",
+                        "Move": f"{loc_to_close} -> {apl}",
+                        "Result": test,
+                        "Improvement": improvement
+                    }
+
+    if best_move is None:
+        print(f"\nNo improving feasible move found at iteration {iteration}.")
+        break
+
+    old_cost = current["total_cost"]
+    current = best_move["Result"]
+
+    search_log.append({
+        "Iteration": iteration,
+        "Operator": best_move["Operator"],
+        "Move": best_move["Move"],
+        "Old_Objective": old_cost,
+        "New_Objective": current["total_cost"],
+        "Improvement": best_move["Improvement"],
+        "Open_Locations": len(current["open_locations"]),
+        "Avg_Distance": current["avg_distance"],
+        "Pop_Weighted_Distance": current["pop_weighted_distance"],
+        "Max_Distance": current["max_distance"],
+        "City_Bounce_Rate": current["city_bounce_rate"],
+        "Capacity_Penalty": current["capacity_penalty"],
+        "Bounce_Penalty": current["bounce_penalty"]
+    })
+
+    print(f"\nIteration {iteration}")
+    print(f"Operator: {best_move['Operator']}")
+    print(f"Move: {best_move['Move']}")
+    print(f"Improvement: €{best_move['Improvement']:,.0f}")
+    print(f"New objective: €{current['total_cost']:,.0f}")
+    print(f"Open locations: {len(current['open_locations'])}")
+    print(f"Avg distance: {current['avg_distance']:.2f} km")
+    print(f"Max distance: {current['max_distance']:.2f} km")
+    print(f"City bounce rate: {current['city_bounce_rate']:.2%}")
+
+# =====================================================
+# 16. FINAL RESULTS
+# =====================================================
+
+final = current
+final_solution = final["solution"]
+final_summary = location_summary(final)
+search_log_df = pd.DataFrame(search_log)
+
+closed_locations = list(
+    set(baseline["open_locations"]) - set(final["open_locations"])
+)
+
+opened_locations = list(
+    set(final["open_locations"]) - set(baseline["open_locations"])
+)
+
+print("\n" + "=" * 75)
+print("IMPROVED LOCAL SEARCH RESULTS")
+print("=" * 75)
+
+print(f"Open locations          : {len(final['open_locations'])} / {len(baseline['open_locations'])}")
+print(f"Closed locations        : {len(closed_locations)}")
+print(f"Opened APLs             : {len(opened_locations)}")
+
+print()
+print(f"Fixed costs             : € {final['fixed_cost']:,.0f}")
+print(f"Variable costs          : € {final['variable_cost']:,.0f}")
+print(f"Capacity penalty        : € {final['capacity_penalty']:,.0f}")
+print(f"Bounce penalty          : € {final['bounce_penalty']:,.0f}")
+print("-" * 45)
+print(f"Model objective         : € {final['total_cost']:,.0f}")
+
+print()
+print(f"Baseline objective      : € {baseline['total_cost']:,.0f}")
+print(f"Final objective         : € {final['total_cost']:,.0f}")
+print(f"Objective saving        : € {baseline['total_cost'] - final['total_cost']:,.0f}")
+print(f"Objective saving %      : {(baseline['total_cost'] - final['total_cost']) / baseline['total_cost'] * 100:.2f}%")
+
+print()
+print(f"Avg distance            : {final['avg_distance']:.2f} km")
+print(f"Pop-weighted avg dist   : {final['pop_weighted_distance']:.2f} km")
+print(f"Max distance            : {final['max_distance']:.2f} km")
+print(f"City bounce rate        : {final['city_bounce_rate']:.2%}")
+
+print()
+print(f"Closed locations        : {closed_locations}")
+print(f"Opened APLs             : {opened_locations}")
+
+# =====================================================
+# 17. SAVE OUTPUTS
+# =====================================================
+
+outputs_dir = BASE_DIR / "outputs"
+outputs_dir.mkdir(exist_ok=True)
+
+final_solution.to_csv(outputs_dir / "final_assignment.csv", index=False)
+final_summary.to_csv(outputs_dir / "final_location_summary.csv", index=False)
+search_log_df.to_csv(outputs_dir / "search_log.csv", index=False)
+
+print("\nOutput files saved in the outputs folder.")
